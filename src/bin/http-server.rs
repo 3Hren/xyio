@@ -552,6 +552,7 @@ struct HttpConnection<D> {
 
     response: Response,
 
+    /// Request dispatcher.
     dispatch: Option<D>,
 }
 
