@@ -1,0 +1,25 @@
+[package]
+name = "xyio"
+version = "0.1.0"
+authors = ["Evgeny Safronov <division494@gmail.com>"]
+license = "LGPL-3.0+"
+
+description = "Proactor I/O"
+
+[dependencies]
+clap = "2"
+
+log = "*"
+bitflags = "*"
+chrono = "*"
+libc = "*"
+nix = "*"
+rmp = "*"
+time = "*"
+
+httparse = "*"
+hyper = "*"
+
+[profile.release]
+debug = true
+panic = 'abort'
