@@ -577,12 +577,17 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                 trace!("EOF");
             }
             Ok(nread) => {
+                // 1. replace rdbuf with Vec::new().
+                // 2. move this.
+                // 3. on success - restore this connection for keep-aliving.
                 trace!("buffer read: {:?}", ::std::str::from_utf8(&self.rdbuf[..nread]).unwrap());
 
                 let mut should_keep_alive = true;
                 let mut dispatch = std::mem::replace(&mut self.dispatch, None).unwrap();
 
                 let complete = {
+                    // TODO: May be preallocated in the connection since we're not support
+                    // pipelining.
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let mut request = httparse::Request::new(&mut headers);
 
@@ -595,6 +600,10 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                                 }
                             }
 
+                            // TODO: We can split prelude & body read buffers to allow simultaneous
+                            // access.
+                            // Then router checks for method, url, headers and handler actually
+                            // works with them.
                             (dispatch)(&Request);
 
                             status.is_complete()
@@ -610,6 +619,10 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                 std::mem::replace(&mut self.dispatch, Some(dispatch));
 
                 // TODO: We should close the connection on any 4xx or 5xx.
+                // TODO: It's true for requests without body. Otherwise we should read all the body.
+                // TODO: Also there can be that after end of body there are more bytes from next
+                //       request. If so, we should respond with 400 (no pipelining support) or to
+                //       memcpy bytes to the beginning and set nread = 0.
                 if complete {
                     trace!("complete");
 
