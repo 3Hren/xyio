@@ -530,6 +530,16 @@ impl Response {
 
 struct Request;
 
+enum HttpStream {
+    Reader,
+    Writer,
+}
+
+enum ReadState {
+    Prelude,
+    Body,
+}
+
 struct HttpConnection<D> {
     /// Read buffer for status line, headers and body.
     ///
@@ -566,6 +576,11 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
             dispatch: Some(dispatch),
         }
     }
+
+    #[inline]
+    fn should_keep_alive(rq: &Request) -> bool {
+        true
+    }
 }
 
 impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
@@ -583,7 +598,6 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                 trace!("buffer read: {:?}", ::std::str::from_utf8(&self.rdbuf[..nread]).unwrap());
 
                 let mut should_keep_alive = true;
-                let mut dispatch = std::mem::replace(&mut self.dispatch, None).unwrap();
 
                 let complete = {
                     // TODO: May be preallocated in the connection since we're not support
@@ -600,12 +614,6 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                                 }
                             }
 
-                            // TODO: We can split prelude & body read buffers to allow simultaneous
-                            // access.
-                            // Then router checks for method, url, headers and handler actually
-                            // works with them.
-                            (dispatch)(&Request);
-
                             status.is_complete()
                         }
                         Err(err) => {
@@ -616,15 +624,40 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                     }
                 };
 
-                std::mem::replace(&mut self.dispatch, Some(dispatch));
-
                 // TODO: We should close the connection on any 4xx or 5xx.
                 // TODO: It's true for requests without body. Otherwise we should read all the body.
+                //       So this code is WRONG!.
                 // TODO: Also there can be that after end of body there are more bytes from next
                 //       request. If so, we should respond with 400 (no pipelining support) or to
                 //       memcpy bytes to the beginning and set nread = 0.
                 if complete {
                     trace!("complete");
+
+                    let mut dispatch = std::mem::replace(&mut self.dispatch, None).unwrap();
+                    // TODO: We can split prelude & body read buffers to allow simultaneous
+                    // access.
+                    // Then router checks for method, url, headers and handler actually
+                    // works with them.
+                    let rw = HttpStream::Reader;
+                    // if Content-Length == 0 || GET || no_body() -> rw = HttpStream::Writer
+                    // else rw = HttpStream::Reader.
+                    (dispatch)(&Request); // on_request(rq: &Request, ctx: &mut Context, rw: HttpStream);
+                    {
+                        match rw {
+                            HttpStream::Reader => {
+                                // sock.async_read(rd, context);
+                                // What to call on completion?
+                            }
+                            HttpStream::Writer => {
+                                // Write response.
+                            }
+                        }
+                    }
+                    // If accept - read body or write response. If write response, then an unread
+                    // request body counter must be. Or to read&drop entire body just after write.
+                    // If Content-Length is set - read exact bytes.
+                    // If not - read until 0\r\n\r\n. Excess bytes copy to prelude buffer.
+                    std::mem::replace(&mut self.dispatch, Some(dispatch));
 
                     self.nread = 0;
 
