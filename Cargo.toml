@@ -18,7 +18,6 @@ rmp = "*"
 time = "*"
 
 httparse = "*"
-hyper = "*"
 
 [profile.release]
 debug = true

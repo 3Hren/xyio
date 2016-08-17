@@ -3,6 +3,7 @@
 #![feature(question_mark)]
 #![feature(unboxed_closures)]
 #![feature(stmt_expr_attributes)]
+#![feature(conservative_impl_trait)]
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate bitflags;
@@ -109,17 +110,6 @@ pub struct EventData {
     pub events: epoll::EpollEventKind,
     pub handle_read: Option<Box<FnBox(&mut Context)>>,
     pub handle_write: Option<Box<FnBox(&mut Context)>>,
-}
-
-pub trait HandleRead {
-    // type Item: Send + 'static;
-    // type Error: Send + 'static;
-    type Stream: StreamRead + 'static;
-
-    fn complete(self: Box<Self>, result: Result<usize, Error>, ctx: &mut Context, rd: Self::Stream);
-    /// Returns a reference to a read buffer where all byte will be read into while reading from
-    /// the stream.
-    fn buf(&mut self) -> &mut [u8];
 }
 
 pub trait HandleWrite {
@@ -262,43 +252,54 @@ impl AsRawFd for TcpSocket {
     }
 }
 
+// struct RingBuf {
+//     // [pppppxxxxxxxxxxxxxx000000]
+//     //       ^             ^
+//     //       consumed      |
+//     //                     position
+//     // AsMut<[u8]> -> &mut [consumed..position]
+//     data: Vec<u8>,
+// }
+
 pub trait StreamRead: Sized + AsRawFd {
-    fn async_read<H>(self, mut handler: Box<H>, context: &mut Context)
+    fn async_read<T, F>(self, buf: T, ctx: &mut Context, f: F)
         where Self: 'static,
-              H: HandleRead<Stream=Self> + 'static
+              T: AsMut<[u8]> + 'static,
+              F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
     {
+        let mut buf = buf;
+
         trace!("receiving bytes");
-        match socket::recv(self.as_raw_fd(), handler.buf(), socket::MsgFlags::empty()) {
+        match socket::recv(self.as_raw_fd(), buf.as_mut(), socket::MsgFlags::empty()) {
             Ok(0) => {
-                //TODO: poll if handler.buf().len() == 0.
                 trace!("read EOF");
-                context.queue.push_back(Operation::User(box move |context: &mut Context| {
-                    handler.complete(Ok(0), context, self)
+                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
+                    f(Ok(0), buf, self, ctx)
                 }))
             }
             Ok(nread) => {
                 trace!("read {} bytes", nread);
-                context.queue.push_back(Operation::User(box move |context: &mut Context| {
-                    handler.complete(Ok(nread), context, self)
+                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
+                    f(Ok(nread), buf, self, ctx)
                 }))
             }
             Err(nix::Error::Sys(err)) if err == nix::errno::EWOULDBLOCK => {
                 trace!("EWOULDBLOCK");
 
                 // Register callback in the fdmap.
-                let ev = context.fdmap.get_mut(&self.as_raw_fd()).unwrap();
-                ev.handle_read = Some(box move |context: &mut Context| {
-                    self.async_read(handler, context)
+                let ev = ctx.fdmap.get_mut(&self.as_raw_fd()).unwrap();
+                ev.handle_read = Some(box move |ctx: &mut Context| {
+                    self.async_read(buf, ctx, f)
                 });
 
                 // Add epoll_wait task to the queue.
-                context.queue.push_back(Operation::Poll);
+                ctx.queue.push_back(Operation::Poll);
             }
             // TODO: EAGAIN, EINTR
             Err(err) => {
                 error!("failed to read: {:?}", err);
-                context.queue.push_back(Operation::User(box move |context: &mut Context| {
-                    handler.complete(Err(err.into()), context, self)
+                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
+                    f(Err(err.into()), buf, self, ctx)
                 }))
             }
         }
@@ -581,12 +582,8 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
     fn should_keep_alive(rq: &Request) -> bool {
         true
     }
-}
 
-impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
-    type Stream = TcpSocket;
-
-    fn complete(mut self: Box<Self>, nread: Result<usize, Error>, context: &mut Context, sock: TcpSocket) {
+    fn on_read(mut self: Box<Self>, nread: Result<usize, Error>, buf: Vec<u8>, sock: TcpSocket, ctx: &mut Context) {
         match nread {
             Ok(0) => {
                 trace!("EOF");
@@ -595,7 +592,7 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                 // 1. replace rdbuf with Vec::new().
                 // 2. move this.
                 // 3. on success - restore this connection for keep-aliving.
-                trace!("buffer read: {:?}", ::std::str::from_utf8(&self.rdbuf[..nread]).unwrap());
+                trace!("buffer read: {:?}", ::std::str::from_utf8(&buf[..nread]).unwrap());
 
                 let mut should_keep_alive = true;
 
@@ -605,7 +602,7 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let mut request = httparse::Request::new(&mut headers);
 
-                    match request.parse(&self.rdbuf[..nread]) {
+                    match request.parse(&buf[..nread]) {
                         Ok(status) => {
                             for header in &request.headers[..] {
                                 if let &httparse::Header { name: "Connection", value: b"Close" } = header {
@@ -679,9 +676,12 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
                     self.response.write(b"\r\n");
                     self.response.write("Ты пидор".as_bytes());
 
-                    sock.async_write(self, context);
+                    self.rdbuf = buf;
+                    sock.async_write(self, ctx);
                 } else {
-                    sock.async_read(self, context);
+                    sock.async_read(buf, ctx, move |nread, buf, sock, ctx| {
+                        self.on_read(nread, buf, sock, ctx)
+                    });
                 }
             }
             Err(err) => {
@@ -689,16 +689,12 @@ impl<F: FnMut(&Request) + 'static> HandleRead for HttpConnection<F> {
             }
         }
     }
-
-    fn buf(&mut self) -> &mut [u8] {
-        &mut self.rdbuf[self.nread..]
-    }
 }
 
 impl<F: FnMut(&Request) + 'static> HandleWrite for HttpConnection<F> {
     type Stream = TcpSocket;
 
-    fn complete(mut self: Box<Self>, result: Result<usize, Error>, context: &mut Context, sock: TcpSocket) {
+    fn complete(mut self: Box<Self>, result: Result<usize, Error>, ctx: &mut Context, sock: TcpSocket) {
         match result {
             Ok(len) => {
                 // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
@@ -707,12 +703,15 @@ impl<F: FnMut(&Request) + 'static> HandleWrite for HttpConnection<F> {
                     trace!("completed write");
 
                     if self.keep_alive {
-                        sock.async_read(self, context);
+                        let buf = std::mem::replace(&mut self.rdbuf, Vec::new());
+                        sock.async_read(buf, ctx, move |nread, buf, sock, ctx| {
+                            self.on_read(nread, buf, sock, ctx)
+                        });
                     } else {
                         trace!("Connection: close");
                     }
                 } else {
-                    sock.async_write(self, context)
+                    sock.async_write(self, ctx)
                 }
             }
             Err(err) => {
@@ -792,7 +791,12 @@ fn run(reactor: i32, rd: i32) {
                         let sock = unsafe {
                             TcpSocket::from_raw_fd(fd, &mut context).unwrap()
                         };
-                        sock.async_read(box HttpConnection::new(|rq| {}), &mut context);
+
+                        let buf = [0; 4096].to_vec();
+                        let conn = box HttpConnection::new(|rq| {});
+                        sock.async_read(buf, &mut context, move |nread, buf, sock, ctx| {
+                            conn.on_read(nread, buf, sock, ctx)
+                        });
                     } else {
                         let fd = event.data as i32;
                         trace!("processing event, fd: {}, events: {:?}", fd, event.events);
