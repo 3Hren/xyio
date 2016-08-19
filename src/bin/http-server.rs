@@ -14,7 +14,7 @@ extern crate nix;
 extern crate xyio;
 
 use std::boxed::FnBox;
-use std::io::{Error, ErrorKind};
+use std::io::{Cursor, Error, ErrorKind};
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr;
@@ -254,16 +254,38 @@ impl AsRawFd for TcpSocket {
 //     data: Vec<u8>,
 // }
 
+pub trait PacketRecv {
+    fn recv(&mut self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error>;
+}
+
+impl<T: AsMut<[u8]>> PacketRecv for Cursor<T> {
+    fn recv(&mut self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error> {
+        let id = self.position() as usize;
+        let mut buf = self.get_mut();
+        socket::recv(fd, &mut buf.as_mut()[id..], flags).map_err(|_| Error::last_os_error())
+    }
+}
+
+pub trait PacketSend {
+    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error>;
+}
+
+impl PacketSend for Vec<u8> {
+    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error> {
+        socket::send(fd, &self[..], flags).map_err(|_| Error::last_os_error())
+    }
+}
+
 pub trait StreamRead: Sized + AsRawFd {
     fn async_recv<T, F>(self, buf: T, ctx: &mut Context, f: F)
         where Self: 'static,
-              T: AsMut<[u8]> + 'static,
+              T: PacketRecv + 'static,
               F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
     {
         let mut buf = buf;
 
         trace!("receiving bytes");
-        match socket::recv(self.as_raw_fd(), buf.as_mut(), socket::MsgFlags::empty()) {
+        match buf.recv(self.as_raw_fd(), socket::MsgFlags::empty()) {
             Ok(0) => {
                 trace!("read EOF");
                 ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
@@ -276,7 +298,7 @@ pub trait StreamRead: Sized + AsRawFd {
                     f(Ok(nread), buf, self, ctx)
                 }))
             }
-            Err(nix::Error::Sys(err)) if err == nix::errno::EWOULDBLOCK => {
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 trace!("EWOULDBLOCK");
 
                 // Register callback in the fdmap.
@@ -299,20 +321,10 @@ pub trait StreamRead: Sized + AsRawFd {
     }
 }
 
-pub trait PacketSent {
-    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error>;
-}
-
-impl PacketSent for Vec<u8> {
-    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error> {
-        socket::send(fd, &self[..], flags).map_err(|_| Error::last_os_error())
-    }
-}
-
 pub trait StreamWrite: Sized + AsRawFd {
     fn async_send<T, F>(self, buf: T, ctx: &mut Context, f: F)
         where Self: 'static,
-              T: PacketSent + 'static,
+              T: PacketSend + 'static,
               F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
     {
         // trace!("sending {:?}", ::std::str::from_utf8(handler.buf()).unwrap());
@@ -474,7 +486,7 @@ impl ResponseBuf {
     }
 }
 
-impl PacketSent for ResponseBuf {
+impl PacketSend for ResponseBuf {
     fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error> {
         let mut offset = self.nwritten;
 
@@ -528,12 +540,12 @@ struct HttpConnection<D> {
     /// By default, the buffer size is equal to 4K bytes, which equals page size on most systems.
     /// If after the end of request processing a connection is transitioned into the keep-alive
     /// state, these buffer is not released.
-    rdbuf: Vec<u8>,
-    /// Left position of the buffer from where reading should be continued while reading HTTP status
-    /// line with headers.
+    ///
+    /// Cursor's position represents left position of the buffer from where reading should be
+    /// continued while reading HTTP status line with headers.
     /// Should be reset on state switch, i.e where there is transition between reading headers and
     /// body.
-    nread: usize,
+    rdbuf: Cursor<Vec<u8>>,
 
     keep_alive: bool,
 
@@ -546,8 +558,7 @@ struct HttpConnection<D> {
 impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
     fn new(dispatch: D) -> Self {
         HttpConnection {
-            rdbuf: [0u8; 4096].to_vec(),
-            nread: 0,
+            rdbuf: Cursor::new(Vec::new()),
             keep_alive: true,
             response: ResponseBuf::new(),
             dispatch: Some(dispatch),
@@ -559,16 +570,15 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
         true
     }
 
-    fn on_recv(mut self: Box<Self>, nread: Result<usize, Error>, buf: Vec<u8>, sock: TcpSocket, ctx: &mut Context) {
+    fn on_recv(mut self: Box<Self>, nread: Result<usize, Error>, buf: Cursor<Vec<u8>>, sock: TcpSocket, ctx: &mut Context) {
         match nread {
             Ok(0) => {
                 trace!("EOF");
             }
             Ok(nread) => {
-                // 1. replace rdbuf with Vec::new().
-                // 2. move this.
-                // 3. on success - restore this connection for keep-aliving.
-                trace!("buffer read: {:?}", ::std::str::from_utf8(&buf[..nread]).unwrap());
+                let mut buf = buf;
+                let id = buf.position() as usize;
+                trace!("buffer read: {:?}", ::std::str::from_utf8(&buf.get_ref()[..id + nread]).unwrap());
 
                 let mut should_keep_alive = true;
 
@@ -578,7 +588,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let mut request = httparse::Request::new(&mut headers);
 
-                    match request.parse(&buf[..nread]) {
+                    match request.parse(&buf.get_ref()[..id + nread]) {
                         Ok(status) => {
                             for header in &request.headers[..] {
                                 if let &httparse::Header { name: "Connection", value: b"Close" } = header {
@@ -605,6 +615,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                 //       memcpy bytes to the beginning and set nread = 0.
                 if complete {
                     trace!("complete");
+                    buf.set_position(0);
 
                     let mut dispatch = std::mem::replace(&mut self.dispatch, None).unwrap();
                     // TODO: We can split prelude & body read buffers to allow simultaneous
@@ -632,9 +643,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     // If not - read until 0\r\n\r\n. Excess bytes copy to prelude buffer.
                     std::mem::replace(&mut self.dispatch, Some(dispatch));
 
-                    self.nread = 0;
                     self.rdbuf = buf;
-
                     let mut bufs = std::mem::replace(&mut self.response, ResponseBuf::new());
 
                     bufs.reset();
@@ -659,6 +668,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                         self.on_send(nwritten, buf, sock, ctx)
                     })
                 } else {
+                    buf.set_position((id + nread) as u64);
                     sock.async_recv(buf, ctx, move |nread, buf, sock, ctx| {
                         self.on_recv(nread, buf, sock, ctx)
                     })
@@ -681,7 +691,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     trace!("completed write");
 
                     if self.keep_alive {
-                        let buf = std::mem::replace(&mut self.rdbuf, Vec::new());
+                        let buf = std::mem::replace(&mut self.rdbuf, Cursor::new(Vec::new()));
                         self.response = response;
                         sock.async_recv(buf, ctx, move |nread, buf, sock, ctx| {
                             self.on_recv(nread, buf, sock, ctx)
@@ -769,7 +779,7 @@ fn run(reactor: i32, rd: i32) {
                             TcpSocket::from_raw_fd(fd, &mut context).unwrap()
                         };
 
-                        let buf = [0; 4096].to_vec();
+                        let buf = Cursor::new([0; 4096].to_vec());
                         let conn = box HttpConnection::new(|rq| {});
                         sock.async_recv(buf, &mut context, move |nread, buf, sock, ctx| {
                             conn.on_recv(nread, buf, sock, ctx)
