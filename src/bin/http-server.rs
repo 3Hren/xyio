@@ -112,13 +112,6 @@ pub struct EventData {
     pub handle_write: Option<Box<FnBox(&mut Context)>>,
 }
 
-pub trait HandleWrite {
-    type Stream: StreamWrite;
-
-    fn complete(self: Box<Self>, nw: Result<usize, Error>, ctx: &mut Context, wr: Self::Stream);
-    fn with_iov<F: Fn(&[&[u8]]) -> Result<usize, Error>>(&self, f: F) -> Result<usize, Error>;
-}
-
 pub enum Operation {
     Poll,
     User(Box<FnBox(&mut Context)>),
@@ -252,7 +245,7 @@ impl AsRawFd for TcpSocket {
     }
 }
 
-// struct RingBuf {
+// struct RingBuf { // TODO: Not so ring.
 //     // [pppppxxxxxxxxxxxxxx000000]
 //     //       ^             ^
 //     //       consumed      |
@@ -306,38 +299,47 @@ pub trait StreamRead: Sized + AsRawFd {
     }
 }
 
+pub trait PacketSent {
+    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error>;
+}
+
+impl PacketSent for Vec<u8> {
+    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error> {
+        socket::send(fd, &self[..], flags).map_err(|_| Error::last_os_error())
+    }
+}
+
 pub trait StreamWrite: Sized + AsRawFd {
-    fn async_write<H>(self, handler: Box<H>, context: &mut Context)
+    fn async_write<T, F>(self, buf: T, ctx: &mut Context, f: F)
         where Self: 'static,
-              H: HandleWrite<Stream=Self> + 'static
+              T: PacketSent + 'static,
+              F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
     {
         // trace!("sending {:?}", ::std::str::from_utf8(handler.buf()).unwrap());
 
-        match handler.with_iov(|iov| sendmsg(self.as_raw_fd(), iov, socket::MsgFlags::empty())) {
-        // match socket::send(self.as_raw_fd(), handler.buf(), socket::MsgFlags::empty()) {
+        match buf.send(self.as_raw_fd(), socket::MsgFlags::empty()) {
             Ok(len) => {
                 trace!("written {} bytes", len);
-                context.queue.push_back(Operation::User(box move |context: &mut Context| {
-                    handler.complete(Ok(len), context, self)
+                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
+                    f(Ok(len), buf, self, ctx)
                 }))
             }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-            // Err(nix::Error::Sys(err)) if err == nix::errno::EWOULDBLOCK => {
                 trace!("EWOULDBLOCK");
 
-                let ev = context.fdmap.get_mut(&self.as_raw_fd()).unwrap();
-                ev.handle_write = Some(box move |context: &mut Context| {
-                    self.async_write(handler, context)
+                let ev = ctx.fdmap.get_mut(&self.as_raw_fd()).unwrap();
+                ev.handle_write = Some(box move |ctx: &mut Context| {
+                    self.async_write(buf, ctx, f)
                 });
 
                 // Add epoll_wait task to the queue.
-                context.queue.push_back(Operation::Poll);
+                ctx.queue.push_back(Operation::Poll);
             }
             // TODO: EINTR.
             Err(err) => {
                 error!("failed to send bytes: {:?}", err);
-                context.queue.push_back(Operation::User(box move |context: &mut Context| {
-                    handler.complete(Err(err.into()), context, self)
+                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
+                    f(Err(err.into()), buf, self, ctx)
                 }))
             }
         }
@@ -428,30 +430,28 @@ const CODE_OK: &'static str = "HTTP/1.1 200 OK\r\n";
 
 /// As we don't support pipelining there can be exactly one Response object in a Connection at a
 /// time which is cleaned up before each writing stage without memory deallocation.
-struct Response {
+struct ResponseBuf {
     /// One of the preallocated HTTP statuses.
-    code: &'static str,
-    headers: Vec<&'static [u8]>,
-    // header_values_buf: Vec<u8>,
-    // header_values_pointers: Vec<(usize, usize)>,
-    body: Vec<u8>, // TODO: Netbuf,
+    status: &'static str,
+    headers: Vec<u8>,
+    body: Vec<u8>,
     size: usize,
     nwritten: usize,
 }
 
-impl Response {
-    fn new() -> Response {
-        Response {
-            code: CODE_OK,
-            headers: Vec::with_capacity(64),
-            body: Vec::with_capacity(4096),
+impl ResponseBuf {
+    fn new() -> Self {
+        ResponseBuf {
+            status: "",
+            headers: Vec::new(),
+            body: Vec::new(),
             size: 0,
             nwritten: 0,
         }
     }
 
     fn reset(&mut self) {
-        self.code = CODE_OK;
+        self.status = "";
         unsafe { self.headers.set_len(0); }
         unsafe { self.body.set_len(0); }
         self.size = 0;
@@ -459,12 +459,12 @@ impl Response {
     }
 
     fn set_status(&mut self, status: &'static str) {
-        self.code = status;
+        self.status = status;
         self.size += status.as_bytes().len();
     }
 
     fn add_header(&mut self, header: &'static str) {
-        self.headers.push(header.as_bytes());
+        self.headers.extend_from_slice(header.as_bytes());
         self.size += header.as_bytes().len();
     }
 
@@ -472,36 +472,34 @@ impl Response {
         self.body.extend_from_slice(data);
         self.size += data.len();
     }
+}
 
-    fn with<R, F: Fn(&[&[u8]]) -> R>(&self, f: F) -> R {
-        let default: &[u8] = unsafe { std::mem::uninitialized() };
-        let mut buf = [default; 1024];
-
-        let mut id = 0;
+impl PacketSent for ResponseBuf {
+    fn send(&self, fd: RawFd, flags: socket::MsgFlags) -> Result<usize, Error> {
         let mut offset = self.nwritten;
 
-        if offset < self.code.as_bytes().len() {
-            buf[id] = &self.code.as_bytes()[offset..];
-            id += 1;
+        // [xxx][yyy][zzz]
+        // [ ^x][yyy][zzz]
+        if offset < self.status.as_bytes().len() {
+            let iobuf = [&self.status.as_bytes()[offset..], &self.headers[..], &self.body[..]];
+            sendmsg(fd, &iobuf, flags)
         } else {
-            offset -= self.code.as_bytes().len();
-        }
-
-        for header in &self.headers {
-            if offset < header.len() {
-                buf[id] = &header[offset..];
-                id += 1;
+            offset -= self.status.as_bytes().len();
+            // [xxx][yyy][zzz]
+            // [   ][ ^y][zzz]
+            if offset < self.headers.len() {
+                let iobuf = [&self.headers[offset..], &self.body[..]];
+                sendmsg(fd, &iobuf, flags)
             } else {
-                offset -= header.len();
+                offset -= self.headers.len();
+                if offset < self.body.len() {
+                    let iobuf = [&self.body[offset..]];
+                    sendmsg(fd, &iobuf, flags)
+                } else {
+                    sendmsg(fd, &[], flags)
+                }
             }
         }
-
-        if offset < self.body.len() {
-            buf[id] = &self.body[offset..];
-            id += 1;
-        }
-
-        f(&buf[..id])
     }
 }
 
@@ -521,13 +519,6 @@ impl Response {
 //       Then replace send with sendmsg.
 //       Measure.
 /// HTTP protocol encoding/decoding and handling.
-
-// >>>>> Parse request, extract headers: X-JSON-RPC-Y.
-// >>>>> Parse body chunked.
-// >>>>> Then get/create TCP socket to the Cocaine.
-// >>>>> Request.
-// >>>>> Response.
-// >>>>> Write status, headers, body(chunked?).
 
 struct Request;
 
@@ -561,7 +552,7 @@ struct HttpConnection<D> {
 
     keep_alive: bool,
 
-    response: Response,
+    response: ResponseBuf,
 
     /// Request dispatcher.
     dispatch: Option<D>,
@@ -573,7 +564,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
             rdbuf: [0u8; 4096].to_vec(),
             nread: 0,
             keep_alive: true,
-            response: Response::new(),
+            response: ResponseBuf::new(),
             dispatch: Some(dispatch),
         }
     }
@@ -657,31 +648,35 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     std::mem::replace(&mut self.dispatch, Some(dispatch));
 
                     self.nread = 0;
+                    self.rdbuf = buf;
 
-                    self.response.reset();
-                    self.response.set_status(CODE_OK);
+                    let mut bufs = std::mem::replace(&mut self.response, ResponseBuf::new());
+
+                    bufs.reset();
+                    bufs.set_status(CODE_OK);
                     // TODO: Date automatically.
                     // TODO: Content-Length automatically.
                     // TODO: Transfer-Encoding automatically.
                     // TODO: Connection automatically.
-                    self.response.add_header("Server: xyio/0.1.0\r\n");
-                    self.response.add_header("Content-Length: 15\r\n");
+                    bufs.add_header("Server: xyio/0.1.0\r\n");
+                    bufs.add_header("Content-Length: 15\r\n");
                     if should_keep_alive {
                         self.response.add_header("Connection: Keep-Alive\r\n");
                     } else {
                         self.keep_alive = false;
                         self.response.add_header("Connection: Close\r\n");
                     }
-                    self.response.add_header("X-Powered-By: Cocaine\r\n");
-                    self.response.write(b"\r\n");
-                    self.response.write("Ты пидор".as_bytes());
+                    bufs.add_header("X-Powered-By: Cocaine\r\n");
+                    bufs.write(b"\r\n");
+                    bufs.write("Ты пидор".as_bytes());
 
-                    self.rdbuf = buf;
-                    sock.async_write(self, ctx);
+                    sock.async_write(bufs, ctx, move |nwritten, buf, sock, ctx| {
+                        self.on_write(nwritten, buf, sock, ctx)
+                    })
                 } else {
                     sock.async_read(buf, ctx, move |nread, buf, sock, ctx| {
                         self.on_read(nread, buf, sock, ctx)
-                    });
+                    })
                 }
             }
             Err(err) => {
@@ -689,21 +684,20 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
             }
         }
     }
-}
 
-impl<F: FnMut(&Request) + 'static> HandleWrite for HttpConnection<F> {
-    type Stream = TcpSocket;
-
-    fn complete(mut self: Box<Self>, result: Result<usize, Error>, ctx: &mut Context, sock: TcpSocket) {
+    fn on_write(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket, ctx: &mut Context) {
         match result {
             Ok(len) => {
                 // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
-                self.response.nwritten += len;
-                if self.response.nwritten == self.response.size {
+                let mut response = response;
+
+                response.nwritten += len;
+                if response.nwritten == response.size {
                     trace!("completed write");
 
                     if self.keep_alive {
                         let buf = std::mem::replace(&mut self.rdbuf, Vec::new());
+                        self.response = response;
                         sock.async_read(buf, ctx, move |nread, buf, sock, ctx| {
                             self.on_read(nread, buf, sock, ctx)
                         });
@@ -711,17 +705,15 @@ impl<F: FnMut(&Request) + 'static> HandleWrite for HttpConnection<F> {
                         trace!("Connection: close");
                     }
                 } else {
-                    sock.async_write(self, ctx)
+                    sock.async_write(response, ctx, move |nsize, buf, sock, ctx| {
+                        self.on_write(nsize, buf, sock, ctx)
+                    })
                 }
             }
             Err(err) => {
                 error!("failed to write into HTTP stream: {:?}", err);
             }
         }
-    }
-
-    fn with_iov<U: Fn(&[&[u8]]) -> Result<usize, Error>>(&self, f: U) -> Result<usize, Error> {
-        self.response.with(f)
     }
 }
 
