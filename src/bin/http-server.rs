@@ -503,21 +503,6 @@ impl PacketSent for ResponseBuf {
     }
 }
 
-// TODO: construct response dynamically.
-// TODO: apply filter.
-
-// static: "HTTP/1.1 200 OK\r\n"
-//         "Server: xyio/0.1.0\r\n"
-//         "Content-Length: "
-// dyn:    "15\r\n", but can be preallocated [u8; 64].
-// static: "Connection: Keep-Alive\r\n"
-//         "X-Powered-By: Cocaine\r\n"
-//         "\r\n"
-// dyn:    "Ты пидор", netbuf.
-
-// TODO: Build the response.
-//       Then replace send with sendmsg.
-//       Measure.
 /// HTTP protocol encoding/decoding and handling.
 
 struct Request;
