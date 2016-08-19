@@ -255,7 +255,7 @@ impl AsRawFd for TcpSocket {
 // }
 
 pub trait StreamRead: Sized + AsRawFd {
-    fn async_read<T, F>(self, buf: T, ctx: &mut Context, f: F)
+    fn async_recv<T, F>(self, buf: T, ctx: &mut Context, f: F)
         where Self: 'static,
               T: AsMut<[u8]> + 'static,
               F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
@@ -282,7 +282,7 @@ pub trait StreamRead: Sized + AsRawFd {
                 // Register callback in the fdmap.
                 let ev = ctx.fdmap.get_mut(&self.as_raw_fd()).unwrap();
                 ev.handle_read = Some(box move |ctx: &mut Context| {
-                    self.async_read(buf, ctx, f)
+                    self.async_recv(buf, ctx, f)
                 });
 
                 // Add epoll_wait task to the queue.
@@ -310,7 +310,7 @@ impl PacketSent for Vec<u8> {
 }
 
 pub trait StreamWrite: Sized + AsRawFd {
-    fn async_write<T, F>(self, buf: T, ctx: &mut Context, f: F)
+    fn async_send<T, F>(self, buf: T, ctx: &mut Context, f: F)
         where Self: 'static,
               T: PacketSent + 'static,
               F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
@@ -329,7 +329,7 @@ pub trait StreamWrite: Sized + AsRawFd {
 
                 let ev = ctx.fdmap.get_mut(&self.as_raw_fd()).unwrap();
                 ev.handle_write = Some(box move |ctx: &mut Context| {
-                    self.async_write(buf, ctx, f)
+                    self.async_send(buf, ctx, f)
                 });
 
                 // Add epoll_wait task to the queue.
@@ -559,7 +559,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
         true
     }
 
-    fn on_read(mut self: Box<Self>, nread: Result<usize, Error>, buf: Vec<u8>, sock: TcpSocket, ctx: &mut Context) {
+    fn on_recv(mut self: Box<Self>, nread: Result<usize, Error>, buf: Vec<u8>, sock: TcpSocket, ctx: &mut Context) {
         match nread {
             Ok(0) => {
                 trace!("EOF");
@@ -618,7 +618,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     {
                         match rw {
                             HttpStream::Reader => {
-                                // sock.async_read(rd, context);
+                                // sock.async_recv(rd, context);
                                 // What to call on completion?
                             }
                             HttpStream::Writer => {
@@ -646,21 +646,21 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     bufs.add_header("Server: xyio/0.1.0\r\n");
                     bufs.add_header("Content-Length: 15\r\n");
                     if should_keep_alive {
-                        self.response.add_header("Connection: Keep-Alive\r\n");
+                        bufs.add_header("Connection: Keep-Alive\r\n");
                     } else {
                         self.keep_alive = false;
-                        self.response.add_header("Connection: Close\r\n");
+                        bufs.add_header("Connection: Close\r\n");
                     }
                     bufs.add_header("X-Powered-By: Cocaine\r\n");
                     bufs.write(b"\r\n");
                     bufs.write("Ты пидор".as_bytes());
 
-                    sock.async_write(bufs, ctx, move |nwritten, buf, sock, ctx| {
-                        self.on_write(nwritten, buf, sock, ctx)
+                    sock.async_send(bufs, ctx, move |nwritten, buf, sock, ctx| {
+                        self.on_send(nwritten, buf, sock, ctx)
                     })
                 } else {
-                    sock.async_read(buf, ctx, move |nread, buf, sock, ctx| {
-                        self.on_read(nread, buf, sock, ctx)
+                    sock.async_recv(buf, ctx, move |nread, buf, sock, ctx| {
+                        self.on_recv(nread, buf, sock, ctx)
                     })
                 }
             }
@@ -670,7 +670,7 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
         }
     }
 
-    fn on_write(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket, ctx: &mut Context) {
+    fn on_send(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket, ctx: &mut Context) {
         match result {
             Ok(len) => {
                 // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
@@ -683,15 +683,15 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     if self.keep_alive {
                         let buf = std::mem::replace(&mut self.rdbuf, Vec::new());
                         self.response = response;
-                        sock.async_read(buf, ctx, move |nread, buf, sock, ctx| {
-                            self.on_read(nread, buf, sock, ctx)
+                        sock.async_recv(buf, ctx, move |nread, buf, sock, ctx| {
+                            self.on_recv(nread, buf, sock, ctx)
                         });
                     } else {
                         trace!("Connection: close");
                     }
                 } else {
-                    sock.async_write(response, ctx, move |nsize, buf, sock, ctx| {
-                        self.on_write(nsize, buf, sock, ctx)
+                    sock.async_send(response, ctx, move |nsize, buf, sock, ctx| {
+                        self.on_send(nsize, buf, sock, ctx)
                     })
                 }
             }
@@ -771,8 +771,8 @@ fn run(reactor: i32, rd: i32) {
 
                         let buf = [0; 4096].to_vec();
                         let conn = box HttpConnection::new(|rq| {});
-                        sock.async_read(buf, &mut context, move |nread, buf, sock, ctx| {
-                            conn.on_read(nread, buf, sock, ctx)
+                        sock.async_recv(buf, &mut context, move |nread, buf, sock, ctx| {
+                            conn.on_recv(nread, buf, sock, ctx)
                         });
                     } else {
                         let fd = event.data as i32;
