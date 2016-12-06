@@ -1,6 +1,5 @@
 #![feature(fnbox)]
 #![feature(box_syntax)]
-#![feature(question_mark)]
 #![feature(unboxed_closures)]
 #![feature(stmt_expr_attributes)]
 #![feature(conservative_impl_trait)]
