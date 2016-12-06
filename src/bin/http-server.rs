@@ -21,6 +21,8 @@ use std::thread;
 use std::rc::Rc;
 use std::collections::{VecDeque, HashMap};
 
+use httparse::Request;
+
 use libc::{c_int};
 
 use clap::{App, Arg};
@@ -111,14 +113,36 @@ pub struct EventData {
     pub handle_write: Option<Box<FnBox(&mut Context)>>,
 }
 
+type UserOperation = Box<FnBox(&mut Context)>;
+
 pub enum Operation {
     Poll,
-    User(Box<FnBox(&mut Context)>),
+    User(UserOperation),
+}
+
+struct Waker {
+    fd: i32,
+    id: u64,
+}
+
+impl Waker {
+    fn wake(&self) -> Result<(), ()> {
+        let buf: [u8; 8] = unsafe { std::mem::transmute(self.id) };
+        write(self.fd, &buf[..])
+            .expect("failed to write into the control channel");
+
+        Ok(())
+    }
 }
 
 // TODO: public elimination.
 pub struct Context {
     pub reactor: RawFd,
+
+    id: u64,
+    eventwr: RawFd,
+    eventrd: RawFd,
+    events: HashMap<u64, UserOperation>,
 
     pub fdmap: HashMap<RawFd, EventData>,
     pub queue: VecDeque<Operation>,
@@ -129,13 +153,44 @@ impl Context {
     pub fn new() -> Result<Context, Error> {
         let fd = epoll_create(EPOLL_CLOEXEC)?;
 
+        let (rd, wr) = pipe2(fcntl::O_NONBLOCK | fcntl::O_CLOEXEC).unwrap();
+
+        let event = epoll::EpollEvent {
+            events: epoll::EPOLLIN | epoll::EPOLLET,
+            data: rd as u64,
+        };
+        epoll::epoll_ctl(fd, epoll::EpollOp::EpollCtlAdd, rd, &event).unwrap();
+
+        let evd = EventData {
+            events: event.events,
+            handle_read: None,
+            handle_write: None,
+        };
+        let mut fdmap = HashMap::new();
+        fdmap.insert(rd, evd);
+
         let ctx = Context {
             reactor: fd,
-            fdmap: HashMap::new(),
+            id: 0,
+            eventwr: wr,
+            eventrd: rd,
+            events: HashMap::new(),
+            fdmap: fdmap,
             queue: VecDeque::new(),
         };
 
         Ok(ctx)
+    }
+
+    fn wake_once(&mut self, op: UserOperation) -> Result<Waker, Error> {
+        self.events.insert(self.id, op);
+        let result = Waker {
+            fd: self.eventwr,
+            id: self.id,
+        };
+        self.id += 1;
+
+        Ok(result)
     }
 }
 
@@ -149,9 +204,29 @@ impl Drop for Context {
 
 impl FromRawFd for Context {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        let (rd, wr) = pipe2(fcntl::O_NONBLOCK | fcntl::O_CLOEXEC).unwrap();
+
+        let event = epoll::EpollEvent {
+            events: epoll::EPOLLIN | epoll::EPOLLET,
+            data: rd as u64,
+        };
+        epoll::epoll_ctl(fd, epoll::EpollOp::EpollCtlAdd, rd, &event).unwrap();
+
+        let evd = EventData {
+            events: event.events,
+            handle_read: None,
+            handle_write: None,
+        };
+        let mut fdmap = HashMap::new();
+        fdmap.insert(rd, evd);
+
         Context {
             reactor: fd,
-            fdmap: HashMap::new(),
+            id: 0,
+            eventwr: wr,
+            eventrd: rd,
+            events: HashMap::new(),
+            fdmap: fdmap,
             queue: VecDeque::new(),
         }
     }
@@ -516,16 +591,16 @@ impl PacketSend for ResponseBuf {
 
 /// HTTP protocol encoding/decoding and handling.
 
-struct Request;
-
-enum HttpStream {
-    Reader,
-    Writer,
-}
-
 enum ReadState {
     Prelude,
     Body,
+}
+
+#[derive(Debug)]
+struct Response;
+
+trait Dispatch {
+    fn on_request(&mut self, request: &Request, response: Response, ctx: &mut Context);
 }
 
 struct HttpConnection<D> {
@@ -554,7 +629,7 @@ struct HttpConnection<D> {
     dispatch: Option<D>,
 }
 
-impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
+impl<D: Dispatch + 'static> HttpConnection<D> {
     fn new(dispatch: D) -> Self {
         HttpConnection {
             rdbuf: Cursor::new(Vec::new()),
@@ -581,14 +656,13 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
 
                 let mut should_keep_alive = true;
 
+                // TODO: Check between ReadState, can be: Prelude, Body.
                 let complete = {
-                    // TODO: May be preallocated in the connection since we're not support
-                    // pipelining.
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let mut request = httparse::Request::new(&mut headers);
 
                     match request.parse(&buf.get_ref()[..id + nread]) {
-                        Ok(status) => {
+                        Ok(status) if status.is_complete() => {
                             for header in &request.headers[..] {
                                 if let &httparse::Header { name: "Connection", value: b"Close" } = header {
                                     should_keep_alive = false;
@@ -596,8 +670,14 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                                 }
                             }
 
-                            status.is_complete()
+                            let response = Response;
+                            if let Some(ref mut dispatch) = self.dispatch {
+                                dispatch.on_request(&request, response, ctx);
+                            }
+
+                            true
                         }
+                        Ok(..) => false,
                         Err(err) => {
                             error!("failed to parse HTTP request: {:?}", err);
                             // TODO: Write 400 and close connection.
@@ -616,31 +696,18 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
                     trace!("complete");
                     buf.set_position(0);
 
-                    let mut dispatch = std::mem::replace(&mut self.dispatch, None).unwrap();
                     // TODO: We can split prelude & body read buffers to allow simultaneous
                     // access.
                     // Then router checks for method, url, headers and handler actually
                     // works with them.
-                    let rw = HttpStream::Reader;
+
                     // if Content-Length == 0 || GET || no_body() -> rw = HttpStream::Writer
                     // else rw = HttpStream::Reader.
-                    (dispatch)(&Request); // on_request(rq: &Request, ctx: &mut Context, rw: HttpStream);
-                    {
-                        match rw {
-                            HttpStream::Reader => {
-                                // sock.async_recv(rd, context);
-                                // What to call on completion?
-                            }
-                            HttpStream::Writer => {
-                                // Write response.
-                            }
-                        }
-                    }
+
                     // If accept - read body or write response. If write response, then an unread
                     // request body counter must be. Or to read&drop entire body just after write.
                     // If Content-Length is set - read exact bytes.
                     // If not - read until 0\r\n\r\n. Excess bytes copy to prelude buffer.
-                    std::mem::replace(&mut self.dispatch, Some(dispatch));
 
                     self.rdbuf = buf;
                     let mut bufs = std::mem::replace(&mut self.response, ResponseBuf::new());
@@ -711,6 +778,21 @@ impl<D: FnMut(&Request) + 'static> HttpConnection<D> {
     }
 }
 
+struct PingDispatch;
+
+impl Dispatch for PingDispatch {
+    fn on_request(&mut self, request: &Request, response: Response, ctx: &mut Context) {
+        debug!(" -- {} -- request:\n  {:<8}: `{}`\n  {:<8}: `{}`", "PING",
+            "Method", request.method.unwrap(),
+            "Path", request.path.unwrap());
+
+        let wake = ctx.wake_once(box move |ctx: &mut Context| {
+            debug!("woken up!");
+        }).unwrap();
+        wake.wake().unwrap();
+    }
+}
+
 fn run(reactor: i32, rd: i32) {
     let mut context = unsafe {
         Context::from_raw_fd(reactor)
@@ -764,6 +846,7 @@ fn run(reactor: i32, rd: i32) {
                 trace!("epoll tick, size: {}", size);
 
                 for event in &events[..size] {
+                    trace!("event.data={}; context.event={}", event.data, context.eventrd);
                     if event.data == rd as u64 {
                         trace!("control event: new connection");
 
@@ -779,10 +862,20 @@ fn run(reactor: i32, rd: i32) {
                         };
 
                         let buf = Cursor::new([0; 4096].to_vec());
-                        let conn = box HttpConnection::new(|rq| {});
+                        let conn = box HttpConnection::new(PingDispatch);
                         sock.async_recv(buf, &mut context, move |nread, buf, sock, ctx| {
                             conn.on_recv(nread, buf, sock, ctx)
                         });
+                    } else if event.data == context.eventrd as u64 {
+                        trace!("control channel: new event");
+
+                        let mut buf = [0u8; 8];
+                        read(context.eventrd, &mut buf[..])
+                            .expect("failed to read from the event channel");
+                        let id: u64 = unsafe { std::mem::transmute(buf) };
+
+                        let op = context.events.remove(&id).unwrap();
+                        op.call_box((&mut context,));
                     } else {
                         let fd = event.data as i32;
                         trace!("processing event, fd: {}, events: {:?}", fd, event.events);
