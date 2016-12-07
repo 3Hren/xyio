@@ -784,6 +784,7 @@ impl Dispatch for PingDispatch {
             "Method", request.method.unwrap(),
             "Path", request.path.unwrap());
 
+        // Simulating deferred write.
         let wake = ctx.wake_once(box move |ctx: &mut Context| {
             debug!("woken up!");
         }).unwrap();
@@ -864,6 +865,7 @@ fn run(reactor: i32, rd: i32) {
                         sock.async_recv(buf, &mut context, move |nread, buf, sock, ctx| {
                             conn.on_recv(nread, buf, sock, ctx)
                         });
+                    // TODO: Kinda hack.
                     } else if event.data == context.eventrd as u64 {
                         trace!("control channel: new event");
 
