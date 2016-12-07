@@ -126,11 +126,9 @@ struct Waker {
 }
 
 impl Waker {
-    fn wake(&self) -> Result<(), ()> {
+    fn wake(self) -> Result<(), Error> {
         let buf: [u8; 8] = unsafe { std::mem::transmute(self.id) };
-        write(self.fd, &buf[..])
-            .expect("failed to write into the control channel");
-
+        write(self.fd, &buf[..])?;
         Ok(())
     }
 }
