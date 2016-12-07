@@ -268,20 +268,6 @@ struct TcpSocket {
 }
 
 impl TcpSocket {
-    fn into_pair(self) -> (TcpSocketReader, TcpSocketWriter) {
-        let fd = Rc::new(self.fd);
-
-        let rd = TcpSocketReader {
-            fd: fd.clone(),
-        };
-
-        let wr = TcpSocketWriter {
-            fd: fd,
-        };
-
-        (rd, wr)
-    }
-
     unsafe fn from_raw_fd(fd: RawFd, context: &mut Context) -> Result<TcpSocket, Error> {
         let ev = epoll::EpollEvent {
             events: epoll::EPOLLIN | epoll::EPOLLOUT | epoll::EPOLLET,
@@ -305,6 +291,20 @@ impl TcpSocket {
         };
 
         Ok(sock)
+    }
+
+    fn into_pair(self) -> (TcpSocketReader, TcpSocketWriter) {
+        let fd = Rc::new(self.fd);
+
+        let rd = TcpSocketReader {
+            fd: fd.clone(),
+        };
+
+        let wr = TcpSocketWriter {
+            fd: fd,
+        };
+
+        (rd, wr)
     }
 }
 
