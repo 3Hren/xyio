@@ -236,15 +236,15 @@ struct FileDesc {
 
 impl Drop for FileDesc {
     fn drop(&mut self) {
-        trace!("closing fd {}", self.fd);
-
         // Note that errors aren't handled when closing a file descriptor. The reason for this is
         // that if an error occurs we don't actually know if the file descriptor was closed or not,
         // and if we retried (for something like EINTR), we might close another valid file
         // descriptor opened after we closed ours.
         // Also note that this syscall may block, for example when there are unflushed buffers.
         if let Err(err) = close(self.fd) {
-            error!("failed to close file descriptor: {:?}", err);
+            error!("failed to close file descriptor {}: {:?}", self.fd, err);
+        } else {
+            debug!("closed fd {}", self.fd);
         }
     }
 }
