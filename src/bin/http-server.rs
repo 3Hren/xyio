@@ -107,13 +107,13 @@ fn sendmsg(fd: RawFd, iov: &[&[u8]], flags: socket::MsgFlags) -> Result<usize, E
     }
 }
 
+pub type UserOperation = Box<FnBox(&mut Context)>;
+
 pub struct EventData {
     pub events: epoll::EpollEventKind,
-    pub handle_read: Option<Box<FnBox(&mut Context)>>,
-    pub handle_write: Option<Box<FnBox(&mut Context)>>,
+    pub handle_read: Option<UserOperation>,
+    pub handle_write: Option<UserOperation>,
 }
-
-type UserOperation = Box<FnBox(&mut Context)>;
 
 pub enum Operation {
     Poll,
