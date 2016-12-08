@@ -13,17 +13,18 @@ extern crate nix;
 extern crate xyio;
 
 use std::boxed::FnBox;
+use std::cell::RefCell;
+use std::collections::{VecDeque, HashMap};
 use std::io::{Cursor, Error, ErrorKind};
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr;
-use std::thread;
 use std::rc::Rc;
-use std::collections::{VecDeque, HashMap};
+use std::thread;
+
+use libc::{c_int, sockaddr, socklen_t};
 
 use httparse::Request;
-
-use libc::{c_int};
 
 use clap::{App, Arg};
 
@@ -107,17 +108,17 @@ fn sendmsg(fd: RawFd, iov: &[&[u8]], flags: socket::MsgFlags) -> Result<usize, E
     }
 }
 
-pub type UserOperation = Box<FnBox(&mut Context)>;
+pub type UserOperation = Box<FnBox()>;
+
+pub enum Operation {
+    Poll,
+    User(UserOperation),
+}
 
 pub struct EventData {
     pub events: epoll::EpollEventKind,
     pub handle_read: Option<UserOperation>,
     pub handle_write: Option<UserOperation>,
-}
-
-pub enum Operation {
-    Poll,
-    User(UserOperation),
 }
 
 struct Waker {
@@ -137,11 +138,6 @@ impl Waker {
 pub struct Context {
     pub reactor: RawFd,
 
-    id: u64,
-    eventwr: RawFd,
-    eventrd: RawFd,
-    events: HashMap<u64, UserOperation>,
-
     pub fdmap: HashMap<RawFd, EventData>,
     pub queue: VecDeque<Operation>,
 }
@@ -151,44 +147,13 @@ impl Context {
     pub fn new() -> Result<Context, Error> {
         let fd = epoll_create(EPOLL_CLOEXEC)?;
 
-        let (rd, wr) = pipe2(fcntl::O_NONBLOCK | fcntl::O_CLOEXEC).unwrap();
-
-        let event = epoll::EpollEvent {
-            events: epoll::EPOLLIN | epoll::EPOLLET,
-            data: rd as u64,
-        };
-        epoll::epoll_ctl(fd, epoll::EpollOp::EpollCtlAdd, rd, &event).unwrap();
-
-        let evd = EventData {
-            events: event.events,
-            handle_read: None,
-            handle_write: None,
-        };
-        let mut fdmap = HashMap::new();
-        fdmap.insert(rd, evd);
-
         let ctx = Context {
             reactor: fd,
-            id: 0,
-            eventwr: wr,
-            eventrd: rd,
-            events: HashMap::new(),
-            fdmap: fdmap,
+            fdmap: HashMap::new(),
             queue: VecDeque::new(),
         };
 
         Ok(ctx)
-    }
-
-    fn wake_once(&mut self, op: UserOperation) -> Result<Waker, Error> {
-        self.events.insert(self.id, op);
-        let result = Waker {
-            fd: self.eventwr,
-            id: self.id,
-        };
-        self.id += 1;
-
-        Ok(result)
     }
 }
 
@@ -202,29 +167,9 @@ impl Drop for Context {
 
 impl FromRawFd for Context {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        let (rd, wr) = pipe2(fcntl::O_NONBLOCK | fcntl::O_CLOEXEC).unwrap();
-
-        let event = epoll::EpollEvent {
-            events: epoll::EPOLLIN | epoll::EPOLLET,
-            data: rd as u64,
-        };
-        epoll::epoll_ctl(fd, epoll::EpollOp::EpollCtlAdd, rd, &event).unwrap();
-
-        let evd = EventData {
-            events: event.events,
-            handle_read: None,
-            handle_write: None,
-        };
-        let mut fdmap = HashMap::new();
-        fdmap.insert(rd, evd);
-
         Context {
             reactor: fd,
-            id: 0,
-            eventwr: wr,
-            eventrd: rd,
-            events: HashMap::new(),
-            fdmap: fdmap,
+            fdmap: HashMap::new(),
             queue: VecDeque::new(),
         }
     }
@@ -263,24 +208,27 @@ impl AsRawFd for FileDesc {
     }
 }
 
+type SharedContext = Rc<RefCell<Context>>;
+
 struct TcpSocket {
     fd: FileDesc,
+    ctx: SharedContext,
 }
 
 impl TcpSocket {
-    unsafe fn from_raw_fd(fd: RawFd, context: &mut Context) -> Result<TcpSocket, Error> {
+    unsafe fn from_raw_fd(fd: RawFd, ctx: &SharedContext) -> Result<TcpSocket, Error> {
         let ev = epoll::EpollEvent {
             events: epoll::EPOLLIN | epoll::EPOLLOUT | epoll::EPOLLET,
             data: fd as u64,
         };
-        epoll::epoll_ctl(context.reactor, epoll::EpollOp::EpollCtlAdd, fd, &ev)?;
+        epoll::epoll_ctl(ctx.borrow_mut().reactor, epoll::EpollOp::EpollCtlAdd, fd, &ev)?;
 
         let evd = EventData {
             events: ev.events,
             handle_read: None,
             handle_write: None,
         };
-        context.fdmap.insert(fd, evd);
+        ctx.borrow_mut().fdmap.insert(fd, evd);
 
         let fd = FileDesc {
             fd: fd,
@@ -288,6 +236,7 @@ impl TcpSocket {
 
         let sock = TcpSocket {
             fd: fd,
+            ctx: ctx.clone(),
         };
 
         Ok(sock)
@@ -298,10 +247,12 @@ impl TcpSocket {
 
         let rd = TcpSocketReader {
             fd: fd.clone(),
+            ctx: self.ctx.clone(),
         };
 
         let wr = TcpSocketWriter {
             fd: fd,
+            ctx: self.ctx,
         };
 
         (rd, wr)
@@ -348,82 +299,112 @@ impl PacketSend for Vec<u8> {
     }
 }
 
-pub trait StreamRead: Sized + AsRawFd {
-    fn async_recv<T, F>(self, buf: T, ctx: &mut Context, f: F)
+pub trait Bound {
+    fn context(&self) -> &SharedContext;
+}
+
+impl Bound for TcpSocket {
+    fn context(&self) -> &SharedContext {
+        &self.ctx
+    }
+}
+
+impl Bound for TcpSocketReader {
+    fn context(&self) -> &SharedContext {
+        &self.ctx
+    }
+}
+
+impl Bound for TcpSocketWriter {
+    fn context(&self) -> &SharedContext {
+        &self.ctx
+    }
+}
+
+pub trait StreamRead: Sized + AsRawFd + Bound {
+    fn async_recv<T, F>(self, buf: T, f: F)
         where Self: 'static,
               T: PacketRecv + 'static,
-              F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
+              F: FnOnce(Result<usize, Error>, T, Self) + 'static
     {
         let mut buf = buf;
 
         trace!("receiving bytes");
+        let mut ctx = self.context().clone();
         match buf.recv(self.as_raw_fd(), socket::MsgFlags::empty()) {
             Ok(0) => {
                 trace!("read EOF");
-                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
-                    f(Ok(0), buf, self, ctx)
+                ctx.borrow_mut().queue.push_back(Operation::User(box move || {
+                    f(Ok(0), buf, self)
                 }))
             }
             Ok(nread) => {
                 trace!("read {} bytes", nread);
-                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
-                    f(Ok(nread), buf, self, ctx)
+                ctx.borrow_mut().queue.push_back(Operation::User(box move || {
+                    f(Ok(nread), buf, self)
                 }))
             }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 trace!("EWOULDBLOCK");
 
                 // Register callback in the fdmap.
-                let ev = ctx.fdmap.get_mut(&self.as_raw_fd()).unwrap();
-                ev.handle_read = Some(box move |ctx: &mut Context| {
-                    self.async_recv(buf, ctx, f)
+                {
+                let mut c = ctx.borrow_mut();
+                let ev = c.fdmap.get_mut(&self.as_raw_fd()).unwrap();
+                ev.handle_read = Some(box move || {
+                    self.async_recv(buf, f)
                 });
+                }
 
                 // Add epoll_wait task to the queue.
-                ctx.queue.push_back(Operation::Poll);
+                ctx.borrow_mut().queue.push_back(Operation::Poll);
             }
             // TODO: EAGAIN, EINTR
             Err(err) => {
                 error!("failed to read: {:?}", err);
-                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
-                    f(Err(err.into()), buf, self, ctx)
+                ctx.borrow_mut().queue.push_back(Operation::User(box move || {
+                    f(Err(err.into()), buf, self)
                 }))
             }
         }
     }
 }
 
-pub trait StreamWrite: Sized + AsRawFd {
-    fn async_send<T, F>(self, buf: T, ctx: &mut Context, f: F)
+pub trait StreamWrite: Sized + AsRawFd + Bound {
+    fn async_send<T, F>(self, buf: T, f: F)
         where Self: 'static,
               T: PacketSend + 'static,
-              F: FnOnce(Result<usize, Error>, T, Self, &mut Context) + 'static
+              F: FnOnce(Result<usize, Error>, T, Self) + 'static
     {
         // trace!("sending {:?}", ::std::str::from_utf8(handler.buf()).unwrap());
 
+        let mut ctx = self.context().clone();
         match buf.send(self.as_raw_fd(), socket::MsgFlags::empty()) {
             Ok(len) => {
                 trace!("written {} bytes", len);
-                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
-                    f(Ok(len), buf, self, ctx)
-                }))
+                ctx.borrow_mut().queue.push_back(Operation::User(box move || {
+                    f(Ok(len), buf, self)
+                }));
             }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 trace!("EWOULDBLOCK");
 
-                let ev = ctx.fdmap.get_mut(&self.as_raw_fd()).unwrap();
-                ev.handle_write = Some(box move |ctx: &mut Context| {
-                    self.async_send(buf, ctx, f)
+                {
+                let mut c = ctx.borrow_mut();
+                let ev = c.fdmap.get_mut(&self.as_raw_fd()).unwrap();
+                ev.handle_write = Some(box move || {
+                    self.async_send(buf, f)
                 });
+                }
 
                 // Add epoll_wait task to the queue.
-                ctx.queue.push_back(Operation::Poll);
+                ctx.borrow_mut().queue.push_back(Operation::Poll);
             }
             // TODO: EINTR.
             Err(err) => {
                 error!("failed to send bytes: {:?}", err);
-                ctx.queue.push_back(Operation::User(box move |ctx: &mut Context| {
-                    f(Err(err.into()), buf, self, ctx)
+                ctx.borrow_mut().queue.push_back(Operation::User(box move || {
+                    f(Err(err.into()), buf, self)
                 }))
             }
         }
@@ -432,6 +413,7 @@ pub trait StreamWrite: Sized + AsRawFd {
 
 pub struct TcpSocketReader {
     fd: Rc<FileDesc>,
+    ctx: SharedContext,
 }
 
 impl StreamRead for TcpSocketReader {}
@@ -448,6 +430,7 @@ impl AsRawFd for TcpSocketReader {
 // To force sending RST we can set SO_LINGER option before closing.
 pub struct TcpSocketWriter {
     fd: Rc<FileDesc>,
+    ctx: SharedContext,
 }
 
 impl StreamWrite for TcpSocketWriter {}
@@ -598,7 +581,7 @@ enum ReadState {
 struct Response;
 
 trait Dispatch {
-    fn on_request(&mut self, request: &Request, response: Response, ctx: &mut Context);
+    fn on_request(&mut self, request: &Request, response: Response);
 }
 
 struct HttpConnection<D> {
@@ -642,7 +625,7 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
         true
     }
 
-    fn on_recv(mut self: Box<Self>, nread: Result<usize, Error>, buf: Cursor<Vec<u8>>, sock: TcpSocket, ctx: &mut Context) {
+    fn on_recv(mut self: Box<Self>, nread: Result<usize, Error>, buf: Cursor<Vec<u8>>, sock: TcpSocket) {
         match nread {
             Ok(0) => {
                 trace!("EOF");
@@ -670,7 +653,7 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
 
                             let response = Response;
                             if let Some(ref mut dispatch) = self.dispatch {
-                                dispatch.on_request(&request, response, ctx);
+                                dispatch.on_request(&request, response);
                             }
 
                             true
@@ -728,13 +711,13 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
                     bufs.write(b"\r\n");
                     bufs.write("Ты пидор".as_bytes());
 
-                    sock.async_send(bufs, ctx, move |nwritten, buf, sock, ctx| {
-                        self.on_send(nwritten, buf, sock, ctx)
+                    sock.async_send(bufs, move |nwritten, buf, sock| {
+                        self.on_send(nwritten, buf, sock)
                     })
                 } else {
                     buf.set_position((id + nread) as u64);
-                    sock.async_recv(buf, ctx, move |nread, buf, sock, ctx| {
-                        self.on_recv(nread, buf, sock, ctx)
+                    sock.async_recv(buf, move |nread, buf, sock| {
+                        self.on_recv(nread, buf, sock)
                     })
                 }
             }
@@ -744,7 +727,7 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
         }
     }
 
-    fn on_send(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket, ctx: &mut Context) {
+    fn on_send(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket) {
         match result {
             Ok(len) => {
                 // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
@@ -757,15 +740,15 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
                     if self.keep_alive {
                         let buf = std::mem::replace(&mut self.rdbuf, Cursor::new(Vec::new()));
                         self.response = response;
-                        sock.async_recv(buf, ctx, move |nread, buf, sock, ctx| {
-                            self.on_recv(nread, buf, sock, ctx)
+                        sock.async_recv(buf, move |nread, buf, sock| {
+                            self.on_recv(nread, buf, sock)
                         });
                     } else {
                         trace!("Connection: close");
                     }
                 } else {
-                    sock.async_send(response, ctx, move |nsize, buf, sock, ctx| {
-                        self.on_send(nsize, buf, sock, ctx)
+                    sock.async_send(response, move |nsize, buf, sock| {
+                        self.on_send(nsize, buf, sock)
                     })
                 }
             }
@@ -779,22 +762,15 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
 struct PingDispatch;
 
 impl Dispatch for PingDispatch {
-    fn on_request(&mut self, request: &Request, response: Response, ctx: &mut Context) {
-        debug!(" -- {} -- request:\n  {:<8}: `{}`\n  {:<8}: `{}`", "PING",
-            "Method", request.method.unwrap(),
-            "Path", request.path.unwrap());
-
-        // Simulating deferred write.
-        let wake = ctx.wake_once(box move |ctx: &mut Context| {
-            debug!("woken up!");
-        }).unwrap();
-        wake.wake().unwrap();
+    fn on_request(&mut self, request: &Request, response: Response) {
+        debug!("processed ping event with Request {{ method: {}, path: {} }}",
+            request.method.unwrap(), request.path.unwrap());
     }
 }
 
 fn run(reactor: i32, rd: i32) {
     let mut context = unsafe {
-        Context::from_raw_fd(reactor)
+        Rc::new(RefCell::new(Context::from_raw_fd(reactor)))
     };
 
     let default: epoll::EpollEvent = unsafe {
@@ -806,14 +782,15 @@ fn run(reactor: i32, rd: i32) {
     loop {
         // Process queue.
         let timeout = {
-            let mut size = context.queue.len();
+            let mut size = context.borrow_mut().queue.len();
             trace!("processing {} operations", size);
 
             while size > 0 {
-                match context.queue.pop_front() {
+                let op = context.borrow_mut().queue.pop_front();
+                match op {
                     Some(Operation::User(op)) => {
                         trace!("user op");
-                        op.call_box((&mut context,))
+                        op.call_box(())
                     }
                     Some(Operation::Poll) => {
                         trace!("poll op");
@@ -829,7 +806,7 @@ fn run(reactor: i32, rd: i32) {
 
             // It is possible that a user puts new pending operations while processing the previous
             // ones. In that case we should wake up immediately instead of sleeping.
-            if context.queue.is_empty() {
+            if context.borrow_mut().queue.is_empty() {
                 60000
             } else {
                 0
@@ -845,7 +822,6 @@ fn run(reactor: i32, rd: i32) {
                 trace!("epoll tick, size: {}", size);
 
                 for event in &events[..size] {
-                    trace!("event.data={}; context.event={}", event.data, context.eventrd);
                     if event.data == rd as u64 {
                         trace!("control event: new connection");
 
@@ -857,45 +833,34 @@ fn run(reactor: i32, rd: i32) {
                         trace!("scheduled new connection, fd: {}", fd);
 
                         let sock = unsafe {
-                            TcpSocket::from_raw_fd(fd, &mut context).unwrap()
+                            TcpSocket::from_raw_fd(fd, &context).unwrap()
                         };
 
                         let buf = Cursor::new([0; 4096].to_vec());
                         let conn = box HttpConnection::new(PingDispatch);
-                        sock.async_recv(buf, &mut context, move |nread, buf, sock, ctx| {
-                            conn.on_recv(nread, buf, sock, ctx)
+                        sock.async_recv(buf, move |nread, buf, sock| {
+                            conn.on_recv(nread, buf, sock)
                         });
-                    // TODO: Kinda hack.
-                    } else if event.data == context.eventrd as u64 {
-                        trace!("control channel: new event");
-
-                        let mut buf = [0u8; 8];
-                        read(context.eventrd, &mut buf[..])
-                            .expect("failed to read from the event channel");
-                        let id: u64 = unsafe { std::mem::transmute(buf) };
-
-                        let op = context.events.remove(&id).unwrap();
-                        op.call_box((&mut context,));
                     } else {
                         let fd = event.data as i32;
                         trace!("processing event, fd: {}, events: {:?}", fd, event.events);
 
-                        let mut ev = context.fdmap.remove(&fd).unwrap();
+                        let mut ev = context.borrow_mut().fdmap.remove(&fd).unwrap();
 
                         // TODO: 1. Out of band events.
                         if event.events.contains(epoll::EPOLLOUT) {
                             if let Some(callback) = std::mem::replace(&mut ev.handle_write, None) {
-                                callback.call_box((&mut context,));
+                                callback.call_box(());
                             }
                         }
 
                         if event.events.contains(epoll::EPOLLIN) {
                             if let Some(callback) = std::mem::replace(&mut ev.handle_read, None) {
-                                callback.call_box((&mut context,));
+                                callback.call_box(());
                             }
                         }
 
-                        context.fdmap.insert(fd, ev);
+                        context.borrow_mut().fdmap.insert(fd, ev);
                     }
                 }
             }
