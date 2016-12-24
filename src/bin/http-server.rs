@@ -8,6 +8,7 @@
 #[macro_use] extern crate bitflags;
 #[macro_use] extern crate clap;
 extern crate httparse;
+extern crate http_muncher;
 extern crate libc;
 extern crate nix;
 extern crate xyio;
@@ -16,15 +17,17 @@ use std::boxed::FnBox;
 use std::cell::RefCell;
 use std::collections::{VecDeque, HashMap};
 use std::io::{Cursor, Error, ErrorKind};
+use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr;
 use std::rc::Rc;
+use std::str;
 use std::thread;
 
 use libc::{c_int, sockaddr, socklen_t};
 
-use httparse::Request;
+use http_muncher::{Parser, ParserHandler};
 
 use clap::{App, Arg};
 
@@ -35,6 +38,7 @@ use nix::sys::{epoll, socket};
 use nix::unistd::{close, pipe2, read, write};
 
 use xyio::logging;
+use xyio::sys::{epoll_create, accept4, EPOLL_CLOEXEC};
 
 mod ffi {
 
@@ -46,45 +50,7 @@ pub struct IoVec {
     iov_len: libc::c_int,
 }
 
-extern {
-    // Linux >= 2.6.27.
-    pub fn epoll_create1(flags: c_int) -> c_int;
-
-    // Linux >= 2.6.28.
-    pub fn accept4(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t, flags: c_int) -> c_int;
-}
-
 } // mod ffi
-
-bitflags! {
-    flags EPollFlags: i32 {
-        const EPOLL_CLOEXEC = 0x80000,
-    }
-}
-
-fn epoll_create(flags: EPollFlags) -> Result<i32, Errno> {
-    let fd = unsafe {
-        ffi::epoll_create1(flags.bits())
-    };
-
-    if fd >= 0 {
-        Ok(fd)
-    } else {
-        Err(Errno::last())
-    }
-}
-
-fn accept4(sockfd: c_int, flags: c_int) -> Result<i32, Errno> {
-    let fd = unsafe {
-        ffi::accept4(sockfd, ptr::null_mut(), ptr::null_mut(), flags)
-    };
-
-    if fd >= 0 {
-        Ok(fd)
-    } else {
-        Err(Errno::last())
-    }
-}
 
 fn sendmsg(fd: RawFd, iov: &[&[u8]], flags: socket::MsgFlags) -> Result<usize, Error> {
     let mhdr = libc::msghdr {
@@ -108,6 +74,8 @@ fn sendmsg(fd: RawFd, iov: &[&[u8]], flags: socket::MsgFlags) -> Result<usize, E
     }
 }
 
+const PIPELINE_NUMBER: usize = 64;
+
 pub type UserOperation = Box<FnBox()>;
 
 pub enum Operation {
@@ -119,19 +87,6 @@ pub struct EventData {
     pub events: epoll::EpollEventKind,
     pub handle_read: Option<UserOperation>,
     pub handle_write: Option<UserOperation>,
-}
-
-struct Waker {
-    fd: i32,
-    id: u64,
-}
-
-impl Waker {
-    fn wake(self) -> Result<(), Error> {
-        let buf: [u8; 8] = unsafe { std::mem::transmute(self.id) };
-        write(self.fd, &buf[..])?;
-        Ok(())
-    }
 }
 
 // TODO: public elimination.
@@ -154,6 +109,12 @@ impl Context {
         };
 
         Ok(ctx)
+    }
+
+    pub fn post<F: FnOnce() + 'static>(&mut self, f: F) {
+        self.queue.push_back(Operation::User(box move || {
+            f()
+        }));
     }
 }
 
@@ -333,13 +294,13 @@ pub trait StreamRead: Sized + AsRawFd + Bound {
         let mut ctx = self.context().clone();
         match buf.recv(self.as_raw_fd(), socket::MsgFlags::empty()) {
             Ok(0) => {
-                trace!("read EOF");
+                trace!("read EOF [fd: {}]", self.as_raw_fd());
                 ctx.borrow_mut().queue.push_back(Operation::User(box move || {
                     f(Ok(0), buf, self)
                 }))
             }
             Ok(nread) => {
-                trace!("read {} bytes", nread);
+                trace!("read {} bytes [fd: {}]", nread, self.as_raw_fd());
                 ctx.borrow_mut().queue.push_back(Operation::User(box move || {
                     f(Ok(nread), buf, self)
                 }))
@@ -371,6 +332,10 @@ pub trait StreamRead: Sized + AsRawFd + Bound {
 }
 
 pub trait StreamWrite: Sized + AsRawFd + Bound {
+    fn send<T: AsRef<[u8]>>(&mut self, buf: T) -> Result<usize, Error> {
+        Ok(socket::send(self.as_raw_fd(), buf.as_ref(), socket::MsgFlags::empty())?)
+    }
+
     fn async_send<T, F>(self, buf: T, f: F)
         where Self: 'static,
               T: PacketSend + 'static,
@@ -441,8 +406,6 @@ impl AsRawFd for TcpSocketWriter {
     }
 }
 
-const CODE_OK: &'static str = "HTTP/1.1 200 OK\r\n";
-
 // struct Line(Cow<'static, str>);
 //
 // trait Header {
@@ -497,6 +460,7 @@ const CODE_OK: &'static str = "HTTP/1.1 200 OK\r\n";
 
 /// As we don't support pipelining there can be exactly one Response object in a Connection at a
 /// time which is cleaned up before each writing stage without memory deallocation.
+#[derive(Debug, Clone)]
 struct ResponseBuf {
     /// One of the preallocated HTTP statuses.
     status: &'static str,
@@ -572,60 +536,182 @@ impl PacketSend for ResponseBuf {
 
 /// HTTP protocol encoding/decoding and handling.
 
-enum ReadState {
-    Prelude,
-    Body,
-}
-
 #[derive(Debug)]
-struct Response;
-
-trait Dispatch {
-    fn on_request(&mut self, request: &Request, response: Response);
+pub struct Request {
+    url: Vec<u8>,
+    headers: Vec<u8>,
 }
 
-struct HttpConnection<D> {
-    /// Read buffer for status line, headers and body.
-    ///
-    /// A request line cannot exceed the size of the buffer, or the 414 (URI Too Long)
-    /// error is returned to the client.
-    /// A request header field cannot exceed the size of the buffer as well, or the 400 error is
-    /// returned to the client.
-    /// Buffer is allocated only on demand after TCP connection establishment.
-    /// By default, the buffer size is equal to 4K bytes, which equals page size on most systems.
-    /// If after the end of request processing a connection is transitioned into the keep-alive
-    /// state, these buffer is not released.
-    ///
-    /// Cursor's position represents left position of the buffer from where reading should be
-    /// continued while reading HTTP status line with headers.
-    /// Should be reset on state switch, i.e where there is transition between reading headers and
-    /// body.
-    rdbuf: Cursor<Vec<u8>>,
-
-    keep_alive: bool,
-
-    response: ResponseBuf,
-
-    /// Request dispatcher.
-    dispatch: Option<D>,
-}
-
-impl<D: Dispatch + 'static> HttpConnection<D> {
-    fn new(dispatch: D) -> Self {
-        HttpConnection {
-            rdbuf: Cursor::new(Vec::new()),
-            keep_alive: true,
-            response: ResponseBuf::new(),
-            dispatch: Some(dispatch),
+impl Request {
+    pub fn new() -> Self {
+        Request {
+            url: Vec::new(),
+            headers: Vec::new(),
         }
     }
 
-    #[inline]
-    fn should_keep_alive(rq: &Request) -> bool {
+    pub fn clear(&mut self) {
+        self.url.clear();
+        self.headers.clear();
+    }
+}
+
+struct Response<D> {
+    /// Request id.
+    id: usize,
+    /// Buffer for status line and headers (and body).
+    buf: Vec<u8>,
+
+    wr: Rc<RefCell<Writer<TcpSocketWriter>>>,
+    state: Rc<RefCell<ConnectionState<D>>>,
+    version: (u16, u16),
+    keepalive: bool,
+}
+
+impl<D: Dispatch + 'static> Response<D> {
+    pub fn new(id: usize, buf: Vec<u8>, wr: Rc<RefCell<Writer<TcpSocketWriter>>>, state: Rc<RefCell<ConnectionState<D>>>, version: (u16, u16), keepalive: bool) -> Self {
+        Response {
+            id: id,
+            buf: buf,
+            wr: wr,
+            state: state,
+            version: version,
+            keepalive: keepalive,
+        }
+    }
+
+    pub fn finish(mut self) {
+        let body = "Ты пидор".as_bytes();
+
+        let mut buf = std::mem::replace(&mut self.buf, Vec::new());
+        write!(buf, "HTTP/{}.{} 200 OK\r\n", self.version.0, self.version.1);
+        // TODO: Date automatically.
+        // TODO: Transfer-Encoding automatically.
+        buf.extend_from_slice(b"Server: xyio/0.1.0\r\n");
+        write!(buf, "Content-Length: {}\r\n", body.len());
+        if self.keepalive {
+            buf.extend_from_slice(b"Connection: Keep-Alive\r\n");
+        } else {
+            buf.extend_from_slice(b"Connection: Close\r\n");
+        }
+        buf.extend_from_slice(b"X-Powered-By: Cocaine\r\n");
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(body);
+        // TODO: Move `state` inside writer?
+        let state = self.state.clone();
+        trace!("buffer write: {:?}", str::from_utf8(&buf[..]).unwrap());
+        self.wr.borrow_mut().write(self.id, buf, move |result, mut buf| {
+            unsafe { buf.set_len(0); }
+            state.borrow_mut().bufs.push(buf);
+            state.borrow_mut().read_more();
+        });
+    }
+}
+
+trait Dispatch: Sized {
+    fn on_request(&mut self, request: &Request, response: Response<Self>);
+}
+
+struct Handler<D> {
+    request: Request,
+    /// Request dispatcher.
+    dispatch: D,
+
+    state: Rc<RefCell<ConnectionState<D>>>,
+    wr: Rc<RefCell<Writer<TcpSocketWriter>>>,
+    buf: Option<Vec<u8>>,
+
+    /// Total requests read in this connection.
+    count: usize,
+}
+
+impl<D: Dispatch + 'static> Handler<D> {
+    fn new(dispatch: D, state: Rc<RefCell<ConnectionState<D>>>, wr: Writer<TcpSocketWriter>) -> Self {
+        Handler {
+            request: Request::new(),
+            dispatch: dispatch,
+            state: state,
+            wr: Rc::new(RefCell::new(wr)),
+            buf: None,
+            count: 0,
+        }
+    }
+}
+
+impl<D: Dispatch + 'static> ParserHandler for Handler<D> {
+    fn on_url(&mut self, parser: &mut Parser, url: &[u8]) -> bool {
+        self.request.url.extend_from_slice(url);
         true
     }
 
-    fn on_recv(mut self: Box<Self>, nread: Result<usize, Error>, buf: Cursor<Vec<u8>>, sock: TcpSocket) {
+    fn on_headers_complete(&mut self, parser: &mut Parser) -> bool {
+        let buf = std::mem::replace(&mut self.buf, None).unwrap();
+        let response = Response::new(
+            self.count % PIPELINE_NUMBER,
+            buf,
+            self.wr.clone(),
+            self.state.clone(),
+            parser.http_version(),
+            parser.should_keep_alive()
+        );
+        self.dispatch.on_request(&self.request, response);
+        self.request.clear();
+        true
+    }
+
+    fn on_message_begin(&mut self, parser: &mut Parser) -> bool {
+        trace!("message begin");
+        self.buf = self.state.borrow_mut().bufs.pop();
+        true
+    }
+
+    fn on_message_complete(&mut self, parser: &mut Parser) -> bool {
+        trace!("message completed [count: {}, bufs: {}]", self.count, self.state.borrow_mut().bufs.len());
+        self.count += 1;
+        // Continue to parse only if there are free response buffers, i.e there are less than N
+        // pipelined sessions active.
+        if self.state.borrow_mut().bufs.len() == 0 {
+            parser.pause();
+        }
+
+        true
+    }
+}
+
+struct Reader<D> {
+    /// Readable stream.
+    rd: Option<TcpSocketReader>,
+
+    /// Read buffer for status line, headers and body.
+    buf: Cursor<Vec<u8>>,
+
+    state: Rc<RefCell<ConnectionState<D>>>,
+
+    parser: Parser,
+    handler: Option<Handler<D>>,
+}
+
+impl<D: Dispatch + 'static> Reader<D> {
+    pub fn new(rd: TcpSocketReader, state: Rc<RefCell<ConnectionState<D>>>, handler: Handler<D>) -> Self {
+        Reader {
+            rd: Some(rd),
+            buf: Cursor::new(vec![0; 4096]),
+            state: state,
+            parser: Parser::request(),
+            handler: Some(handler),
+        }
+    }
+
+    fn read_more(mut self) {
+        let mut rd = std::mem::replace(&mut self.rd, None).unwrap();
+        let buf = std::mem::replace(&mut self.buf, Cursor::new(Vec::new()));
+        debug!("switched reader state to `reading`");
+        rd.async_recv(buf, move |nread, buf, sock| {
+            self.on_recv(nread, buf, sock)
+        });
+    }
+
+    fn on_recv(mut self, nread: Result<usize, Error>, buf: Cursor<Vec<u8>>, sock: TcpSocketReader) {
         match nread {
             Ok(0) => {
                 trace!("EOF");
@@ -633,39 +719,39 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
             Ok(nread) => {
                 let mut buf = buf;
                 let id = buf.position() as usize;
-                trace!("buffer read: {:?}", ::std::str::from_utf8(&buf.get_ref()[..id + nread]).unwrap());
+                trace!("buffer read: {:?}", str::from_utf8(&buf.get_ref()[..id + nread]).unwrap());
 
-                let mut should_keep_alive = true;
+                self.parser.unpause();
+                let mut handler = std::mem::replace(&mut self.handler, None).unwrap();
+                let nparsed = self.parser.parse(&mut handler, &buf.get_ref()[..id + nread]);
+                trace!("parsed {} bytes [fd: {}]", nparsed, sock.as_raw_fd());
 
-                // TODO: Check between ReadState, can be: Prelude, Body.
-                let complete = {
-                    let mut headers = [httparse::EMPTY_HEADER; 64];
-                    let mut request = httparse::Request::new(&mut headers);
+                if self.state.borrow_mut().bufs.len() == 0 {
+                    buf.set_position((id + nread - nparsed) as u64);
+                    self.rd = Some(sock);
+                    self.buf = buf;
+                    self.handler = Some(handler);
+                    let state = self.state.clone();
+                    debug!("switched reader state to `idle` [fd: {}]", self.rd.as_ref().unwrap().as_raw_fd());
+                    state.borrow_mut().rd = Some(self);
+                    return;
+                }
 
-                    match request.parse(&buf.get_ref()[..id + nread]) {
-                        Ok(status) if status.is_complete() => {
-                            for header in &request.headers[..] {
-                                if let &httparse::Header { name: "Connection", value: b"Close" } = header {
-                                    should_keep_alive = false;
-                                    break;
-                                }
-                            }
+                if self.parser.has_error() {
+                    error!("failed to parse HTTP request: {:?}", self.parser.error());
+                    return;
+                }
 
-                            let response = Response;
-                            if let Some(ref mut dispatch) = self.dispatch {
-                                dispatch.on_request(&request, response);
-                            }
+                if nparsed != id + nread {
+                    error!("failed to parse HTTP request: {:?}", self.parser.error());
+                    // TODO: Write 400 and close connection.
+                    return;
+                }
 
-                            true
-                        }
-                        Ok(..) => false,
-                        Err(err) => {
-                            error!("failed to parse HTTP request: {:?}", err);
-                            // TODO: Write 400 and close connection.
-                            return;
-                        }
-                    }
-                };
+                self.handler = Some(handler);
+                sock.async_recv(buf, move |nread, buf, sock| {
+                    self.on_recv(nread, buf, sock)
+                })
 
                 // TODO: We should close the connection on any 4xx or 5xx.
                 // TODO: It's true for requests without body. Otherwise we should read all the body.
@@ -673,98 +759,193 @@ impl<D: Dispatch + 'static> HttpConnection<D> {
                 // TODO: Also there can be that after end of body there are more bytes from next
                 //       request. If so, we should respond with 400 (no pipelining support) or to
                 //       memcpy bytes to the beginning and set nread = 0.
-                if complete {
-                    trace!("complete");
-                    buf.set_position(0);
-
-                    // TODO: We can split prelude & body read buffers to allow simultaneous
-                    // access.
-                    // Then router checks for method, url, headers and handler actually
-                    // works with them.
-
-                    // if Content-Length == 0 || GET || no_body() -> rw = HttpStream::Writer
-                    // else rw = HttpStream::Reader.
-
-                    // If accept - read body or write response. If write response, then an unread
-                    // request body counter must be. Or to read&drop entire body just after write.
-                    // If Content-Length is set - read exact bytes.
-                    // If not - read until 0\r\n\r\n. Excess bytes copy to prelude buffer.
-
-                    self.rdbuf = buf;
-                    let mut bufs = std::mem::replace(&mut self.response, ResponseBuf::new());
-
-                    bufs.reset();
-                    bufs.set_status(CODE_OK);
-                    // TODO: Date automatically.
-                    // TODO: Content-Length automatically.
-                    // TODO: Transfer-Encoding automatically.
-                    // TODO: Connection automatically.
-                    bufs.add_header("Server: xyio/0.1.0\r\n");
-                    bufs.add_header("Content-Length: 15\r\n");
-                    if should_keep_alive {
-                        bufs.add_header("Connection: Keep-Alive\r\n");
-                    } else {
-                        self.keep_alive = false;
-                        bufs.add_header("Connection: Close\r\n");
-                    }
-                    bufs.add_header("X-Powered-By: Cocaine\r\n");
-                    bufs.write(b"\r\n");
-                    bufs.write("Ты пидор".as_bytes());
-
-                    sock.async_send(bufs, move |nwritten, buf, sock| {
-                        self.on_send(nwritten, buf, sock)
-                    })
-                } else {
-                    buf.set_position((id + nread) as u64);
-                    sock.async_recv(buf, move |nread, buf, sock| {
-                        self.on_recv(nread, buf, sock)
-                    })
-                }
+                // if complete {
+                //     trace!("complete");
+                //     buf.set_position(0);
+                //
+                //     // TODO: We can split prelude & body read buffers to allow simultaneous
+                //     // access.
+                //     // Then router checks for method, url, headers and handler actually
+                //     // works with them.
+                //
+                //     // if Content-Length == 0 || GET || no_body() -> rw = HttpStream::Writer
+                //     // else rw = HttpStream::Reader.
+                //
+                //     // If accept - read body or write response. If write response, then an unread
+                //     // request body counter must be. Or to read&drop entire body just after write.
+                //     // If Content-Length is set - read exact bytes.
+                //     // If not - read until 0\r\n\r\n. Excess bytes copy to prelude buffer.
             }
             Err(err) => {
                 error!("failed to read HTTP stream: {:?}", err);
             }
         }
     }
+}
 
-    fn on_send(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket) {
-        match result {
-            Ok(len) => {
-                // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
-                let mut response = response;
+enum WriterState {
+    Idle,
+    Pending,
+}
 
-                response.nwritten += len;
-                if response.nwritten == response.size {
-                    trace!("completed write");
+struct Writer<W> {
+    /// Writable stream.
+    wr: W,
+    state: WriterState,
 
-                    if self.keep_alive {
-                        let buf = std::mem::replace(&mut self.rdbuf, Cursor::new(Vec::new()));
-                        self.response = response;
-                        sock.async_recv(buf, move |nread, buf, sock| {
-                            self.on_recv(nread, buf, sock)
-                        });
-                    } else {
-                        trace!("Connection: close");
-                    }
-                } else {
-                    sock.async_send(response, move |nsize, buf, sock| {
-                        self.on_send(nsize, buf, sock)
-                    })
+    bufs: Vec<Cursor<Vec<u8>>>,
+    cur: usize,
+    end: usize,
+
+    callbacks: Vec<Option<Box<FnBox(Result<(), Error>, Vec<u8>)>>>,
+}
+
+impl<W: StreamWrite> Writer<W> {
+    fn new(wr: W) -> Self {
+        let mut callbacks = Vec::with_capacity(PIPELINE_NUMBER);
+        for _ in 0..PIPELINE_NUMBER {
+            callbacks.push(None);
+        }
+
+        Writer {
+            wr: wr,
+            state: WriterState::Idle,
+
+            bufs: vec![Cursor::new(Vec::new()); PIPELINE_NUMBER],
+            cur: 0,
+            end: 0,
+            callbacks: callbacks,
+        }
+    }
+
+    fn write<F>(&mut self, id: usize, buf: Vec<u8>, f: F)
+        where F: Fn(Result<(), Error>, Vec<u8>) + 'static
+    {
+        // Try to write some data right away, if we don't have anything pending.
+        if let WriterState::Idle = self.state {
+            match self.wr.send(&buf[..]) {
+                Ok(nsize) if nsize == buf.len() => {
+                    trace!("written {} bytes [request {}, fd: {}]", nsize, id, self.wr.as_raw_fd());
+                    // Operation has been completed immediately, such performance, wow.
+                    let fd = self.wr.as_raw_fd();
+                    self.wr.context().borrow_mut().post(move || {
+                        trace!("completed response write operation [fd: {}]", fd);
+                        f(Ok(()), buf);
+                    });
+                    return;
+                }
+                Ok(nsize) => {
+                    unimplemented!();
+                    // self.bufs[id] = Cursor::new(buf);
+                    // self.bufs[id].set_position(nsize as u64);
+                    // self.callbacks[id] = Some(box f)
+                }
+                Err(err) => {
+                    error!("failed to write: {:?}", err);
                 }
             }
-            Err(err) => {
-                error!("failed to write into HTTP stream: {:?}", err);
-            }
+        }
+
+        if let WriterState::Pending = std::mem::replace(&mut self.state, WriterState::Pending) {
+            return;
+        }
+
+        // TODO: Start async operation.
+        unimplemented!();
+    }
+}
+
+struct ConnectionState<D> {
+    /// Response buffers.
+    ///
+    /// Before decoding a readable buffer we don't know how many requests it will contain.
+    bufs: Vec<Vec<u8>>,
+
+    rd: Option<Reader<D>>,
+}
+
+impl<D: Dispatch + 'static> ConnectionState<D> {
+    fn new() -> Self {
+        let mut bufs = vec![vec![0; 4096]; PIPELINE_NUMBER];
+        for buf in &mut bufs {
+            buf.clear();
+        }
+
+        ConnectionState {
+            bufs: bufs,
+            rd: None,
+        }
+    }
+
+    pub fn read_more(&mut self) {
+        if let Some(rd) = std::mem::replace(&mut self.rd, None) {
+            debug!("start reader task [fd: {}]", rd.rd.as_ref().unwrap().as_raw_fd());
+            rd.read_more();
         }
     }
 }
 
+/// Read buffer for status line, headers and body.
+///
+/// A request line cannot exceed the size of the buffer, or the 414 (URI Too Long)
+/// error is returned to the client.
+/// A request header field cannot exceed the size of the buffer as well, or the 400 error is
+/// returned to the client.
+/// Buffer is allocated only on demand after TCP connection establishment.
+/// By default, the buffer size is equal to 4K bytes, which equals page size on most systems.
+/// If after the end of request processing a connection is transitioned into the keep-alive
+/// state, these buffer is not released.
+///
+/// Cursor's position represents left position of the buffer from where reading should be
+/// continued while reading HTTP status line with headers.
+/// Should be reset on state switch, i.e where there is transition between reading headers and
+/// body.
+fn make_connection<D: Dispatch + 'static>(dispatch: D, sock: TcpSocket) {
+    let (rd, wr) = sock.into_pair();
+
+    let state = Rc::new(RefCell::new(ConnectionState::new()));
+    let handler = Handler::new(dispatch, state.clone(), Writer::new(wr));
+    state.borrow_mut().rd = Some(Reader::new(rd, state.clone(), handler));
+    state.borrow_mut().read_more();
+}
+
+    // fn on_send(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket) {
+    //     match result {
+    //         Ok(len) => {
+    //             // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
+    //             let mut response = response;
+    //
+    //             response.nwritten += len;
+    //             if response.nwritten == response.size {
+    //                 trace!("completed write");
+    //
+    //                 if self.keep_alive {
+    //                     let buf = std::mem::replace(&mut self.rdbuf, Cursor::new(Vec::new()));
+    //                     self.response = response;
+    //                     sock.async_recv(buf, move |nread, buf, sock| {
+    //                         self.on_recv(nread, buf, sock)
+    //                     });
+    //                 } else {
+    //                     trace!("Connection: close");
+    //                 }
+    //             } else {
+    //                 sock.async_send(response, move |nsize, buf, sock| {
+    //                     self.on_send(nsize, buf, sock)
+    //                 })
+    //             }
+    //         }
+    //         Err(err) => {
+    //             error!("failed to write into HTTP stream: {:?}", err);
+    //         }
+    //     }
+    // }
+
 struct PingDispatch;
 
 impl Dispatch for PingDispatch {
-    fn on_request(&mut self, request: &Request, response: Response) {
-        debug!("processed ping event with Request {{ method: {}, path: {} }}",
-            request.method.unwrap(), request.path.unwrap());
+    fn on_request(&mut self, request: &Request, response: Response<Self>) {
+        debug!("processed ping event with Request {{ url: '{}' }}", str::from_utf8(&request.url[..]).unwrap());
+        response.finish();
     }
 }
 
@@ -836,11 +1017,7 @@ fn run(reactor: i32, rd: i32) {
                             TcpSocket::from_raw_fd(fd, &context).unwrap()
                         };
 
-                        let buf = Cursor::new([0; 4096].to_vec());
-                        let conn = box HttpConnection::new(PingDispatch);
-                        sock.async_recv(buf, move |nread, buf, sock| {
-                            conn.on_recv(nread, buf, sock)
-                        });
+                        make_connection(PingDispatch, sock);
                     } else {
                         let fd = event.data as i32;
                         trace!("processing event, fd: {}, events: {:?}", fd, event.events);
@@ -950,6 +1127,7 @@ fn start(nthreads: usize) {
 
                 debug!("scheduled into {} worker", sched);
             }
+            // TODO: Handle EMFILE.
             Err(err) => {
                 error!("failed to accept: {:?}", err);
                 break;

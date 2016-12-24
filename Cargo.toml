@@ -18,6 +18,7 @@ rmp = "*"
 time = "*"
 
 httparse = "*"
+http-muncher = {git = "https://github.com/3Hren/rust-streaming-http-parser"}
 
 [profile.release]
 debug = true
