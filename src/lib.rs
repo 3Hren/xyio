@@ -1,17 +1,20 @@
-#[macro_use]
-extern crate bitflags;
-#[macro_use]
-extern crate log;
+#![feature(fnbox)]
+#![feature(box_syntax)]
+#![feature(unboxed_closures)]
+#![feature(stmt_expr_attributes)]
+#![feature(conservative_impl_trait)]
 
+#[macro_use] extern crate bitflags;
 extern crate chrono;
 extern crate libc;
+#[macro_use] extern crate log;
 
 extern crate nix;
+extern crate httparse;
+extern crate http_muncher;
 
-mod xyio;
-
-pub use xyio::collections;
-pub use xyio::logging;
-
-// TODO: Drop pub when it's time to hide implementation details.
-pub use xyio::sys;
+pub mod collections;
+// pub mod io;
+pub mod logging;
+pub mod sys;
+pub mod http;

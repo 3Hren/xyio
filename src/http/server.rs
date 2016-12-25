@@ -1,18 +1,4 @@
-#![feature(fnbox)]
-#![feature(box_syntax)]
-#![feature(unboxed_closures)]
-#![feature(stmt_expr_attributes)]
-#![feature(conservative_impl_trait)]
-
-#[macro_use] extern crate log;
-#[macro_use] extern crate bitflags;
-#[macro_use] extern crate clap;
-extern crate httparse;
-extern crate http_muncher;
-extern crate libc;
-extern crate nix;
-extern crate xyio;
-
+use std;
 use std::boxed::FnBox;
 use std::cell::RefCell;
 use std::collections::{VecDeque, HashMap};
@@ -20,59 +6,17 @@ use std::io::{Cursor, Error, ErrorKind};
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::ptr;
 use std::rc::Rc;
 use std::str;
 use std::thread;
 
-use libc::{c_int, sockaddr, socklen_t};
-
 use http_muncher::{Parser, ParserHandler};
 
-use clap::{App, Arg};
-
-use nix::errno::Errno;
 use nix::fcntl;
 use nix::sys::{epoll, socket};
-// use nix::sys::uio::IoVec;
 use nix::unistd::{close, pipe2, read, write};
 
-use xyio::logging;
-use xyio::sys::{epoll_create, accept4, EPOLL_CLOEXEC};
-
-mod ffi {
-
-use libc::{self, c_int, sockaddr, socklen_t};
-
-#[repr(C)]
-pub struct IoVec {
-    iov_base: *mut libc::c_void,
-    iov_len: libc::c_int,
-}
-
-} // mod ffi
-
-fn sendmsg(fd: RawFd, iov: &[&[u8]], flags: socket::MsgFlags) -> Result<usize, Error> {
-    let mhdr = libc::msghdr {
-        msg_name: 0 as *mut libc::c_void,
-        msg_namelen: 0,
-        msg_iov: iov.as_ptr() as *mut ffi::IoVec as *mut libc::iovec,
-        msg_iovlen: iov.len(),
-        msg_control: 0 as *mut libc::c_void,
-        msg_controllen: 0,
-        msg_flags: 0,
-    };
-
-    let rc = unsafe {
-        libc::sendmsg(fd, &mhdr, flags.bits())
-    };
-
-    if rc < 0 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(rc as usize)
-    }
-}
+use sys::{epoll_create, accept4, sendmsg, EPOLL_CLOEXEC};
 
 const PIPELINE_NUMBER: usize = 64;
 
@@ -136,6 +80,7 @@ impl FromRawFd for Context {
     }
 }
 
+/// Auto-closable raw file descriptor owner.
 struct FileDesc {
     fd: RawFd,
 }
@@ -683,6 +628,20 @@ struct Reader<D> {
     rd: Option<TcpSocketReader>,
 
     /// Read buffer for status line, headers and body.
+    ///
+    /// A request line cannot exceed the size of the buffer, or the 414 (URI Too Long)
+    /// error is returned to the client.
+    /// A request header field cannot exceed the size of the buffer as well, or the 400 error is
+    /// returned to the client.
+    /// Buffer is allocated only on demand after TCP connection establishment.
+    /// By default, the buffer size is equal to 4K bytes, which equals page size on most systems.
+    /// If after the end of request processing a connection is transitioned into the keep-alive
+    /// state, this buffer is not released.
+    ///
+    /// Cursor's position represents left position of the buffer from where reading should be
+    /// continued while reading HTTP status line with headers.
+    /// Should be reset on state switch, i.e where there is transition between reading headers and
+    /// body.
     buf: Cursor<Vec<u8>>,
 
     state: Rc<RefCell<ConnectionState<D>>>,
@@ -717,7 +676,6 @@ impl<D: Dispatch + 'static> Reader<D> {
                 trace!("EOF");
             }
             Ok(nread) => {
-                let mut buf = buf;
                 let id = buf.position() as usize;
                 trace!("buffer read: {:?}", str::from_utf8(&buf.get_ref()[..id + nread]).unwrap());
 
@@ -727,6 +685,7 @@ impl<D: Dispatch + 'static> Reader<D> {
                 trace!("parsed {} bytes [fd: {}]", nparsed, sock.as_raw_fd());
 
                 if self.state.borrow_mut().bufs.len() == 0 {
+                    let mut buf = buf;
                     buf.set_position((id + nread - nparsed) as u64);
                     self.rd = Some(sock);
                     self.buf = buf;
@@ -742,6 +701,7 @@ impl<D: Dispatch + 'static> Reader<D> {
                     return;
                 }
 
+                // TODO: Should close the connection on any 4xx or 5xx?
                 if nparsed != id + nread {
                     error!("failed to parse HTTP request: {:?}", self.parser.error());
                     // TODO: Write 400 and close connection.
@@ -752,29 +712,6 @@ impl<D: Dispatch + 'static> Reader<D> {
                 sock.async_recv(buf, move |nread, buf, sock| {
                     self.on_recv(nread, buf, sock)
                 })
-
-                // TODO: We should close the connection on any 4xx or 5xx.
-                // TODO: It's true for requests without body. Otherwise we should read all the body.
-                //       So this code is WRONG!.
-                // TODO: Also there can be that after end of body there are more bytes from next
-                //       request. If so, we should respond with 400 (no pipelining support) or to
-                //       memcpy bytes to the beginning and set nread = 0.
-                // if complete {
-                //     trace!("complete");
-                //     buf.set_position(0);
-                //
-                //     // TODO: We can split prelude & body read buffers to allow simultaneous
-                //     // access.
-                //     // Then router checks for method, url, headers and handler actually
-                //     // works with them.
-                //
-                //     // if Content-Length == 0 || GET || no_body() -> rw = HttpStream::Writer
-                //     // else rw = HttpStream::Reader.
-                //
-                //     // If accept - read body or write response. If write response, then an unread
-                //     // request body counter must be. Or to read&drop entire body just after write.
-                //     // If Content-Length is set - read exact bytes.
-                //     // If not - read until 0\r\n\r\n. Excess bytes copy to prelude buffer.
             }
             Err(err) => {
                 error!("failed to read HTTP stream: {:?}", err);
@@ -858,7 +795,12 @@ impl<W: StreamWrite> Writer<W> {
 struct ConnectionState<D> {
     /// Response buffers.
     ///
-    /// Before decoding a readable buffer we don't know how many requests it will contain.
+    /// This is a fixed-sized container of preallocated (but growable) buffers for responses. The
+    /// total count of these buffers equals the number of maximum allowed concurrent requests. Each
+    /// time a new request is ready to be processed we try to pop one buffer, which is returned
+    /// after response write completion.
+    /// If there are no more buffers, a reader task is paused until at least one response is
+    /// written.
     bufs: Vec<Vec<u8>>,
 
     rd: Option<Reader<D>>,
@@ -885,21 +827,6 @@ impl<D: Dispatch + 'static> ConnectionState<D> {
     }
 }
 
-/// Read buffer for status line, headers and body.
-///
-/// A request line cannot exceed the size of the buffer, or the 414 (URI Too Long)
-/// error is returned to the client.
-/// A request header field cannot exceed the size of the buffer as well, or the 400 error is
-/// returned to the client.
-/// Buffer is allocated only on demand after TCP connection establishment.
-/// By default, the buffer size is equal to 4K bytes, which equals page size on most systems.
-/// If after the end of request processing a connection is transitioned into the keep-alive
-/// state, these buffer is not released.
-///
-/// Cursor's position represents left position of the buffer from where reading should be
-/// continued while reading HTTP status line with headers.
-/// Should be reset on state switch, i.e where there is transition between reading headers and
-/// body.
 fn make_connection<D: Dispatch + 'static>(dispatch: D, sock: TcpSocket) {
     let (rd, wr) = sock.into_pair();
 
@@ -908,37 +835,6 @@ fn make_connection<D: Dispatch + 'static>(dispatch: D, sock: TcpSocket) {
     state.borrow_mut().rd = Some(Reader::new(rd, state.clone(), handler));
     state.borrow_mut().read_more();
 }
-
-    // fn on_send(mut self: Box<Self>, result: Result<usize, Error>, response: ResponseBuf, sock: TcpSocket) {
-    //     match result {
-    //         Ok(len) => {
-    //             // trace!("buffer write: {:?}", std::str::from_utf8(&self.wrbuf[..len]).unwrap());
-    //             let mut response = response;
-    //
-    //             response.nwritten += len;
-    //             if response.nwritten == response.size {
-    //                 trace!("completed write");
-    //
-    //                 if self.keep_alive {
-    //                     let buf = std::mem::replace(&mut self.rdbuf, Cursor::new(Vec::new()));
-    //                     self.response = response;
-    //                     sock.async_recv(buf, move |nread, buf, sock| {
-    //                         self.on_recv(nread, buf, sock)
-    //                     });
-    //                 } else {
-    //                     trace!("Connection: close");
-    //                 }
-    //             } else {
-    //                 sock.async_send(response, move |nsize, buf, sock| {
-    //                     self.on_send(nsize, buf, sock)
-    //                 })
-    //             }
-    //         }
-    //         Err(err) => {
-    //             error!("failed to write into HTTP stream: {:?}", err);
-    //         }
-    //     }
-    // }
 
 struct PingDispatch;
 
@@ -1079,7 +975,7 @@ fn run(reactor: i32, rd: i32) {
 //     Ok((wr, rd))
 // }
 
-fn start(nthreads: usize) {
+pub fn serve(nthreads: usize) {
     let mut workers = Vec::with_capacity(nthreads);
     for tid in 0..nthreads {
         let epollfd = epoll_create(EPOLL_CLOEXEC)
@@ -1136,35 +1032,35 @@ fn start(nthreads: usize) {
     }
 
     for (thread, wr, rd) in workers.drain(..) {
-        close(rd).unwrap();
+        close(rd).map(drop);
         close(wr).unwrap();
 
         thread.join().unwrap();
     }
 }
 
-fn main() {
-    let matches = App::new("Proof of concept of asynchronous HTTP 1.1 server")
-        .author(crate_authors!())
-        .version(crate_version!())
-        .arg(Arg::with_name("threads")
-           .short("t")
-           .long("threads")
-           .value_name("THREADS")
-           .help("number of worker threads")
-           .takes_value(true))
-        .arg(Arg::with_name("v")
-           .short("v")
-           .multiple(true)
-           .help("verbosity level"))
-        .get_matches();
+trait DispatchFactory {
+    type Dispatch: Dispatch;
 
-    logging::init(logging::from_usize(matches.occurrences_of("v") as usize))
-        .expect("failed to initialize logging system");
+    fn create(&self) -> Self::Dispatch;
+}
 
-    let nthreads = matches.value_of("threads")
-        .map_or(Ok(4), |v| v.parse())
-        .expect("failed to parse \"number of worker threads\" argument");
+pub struct Terminator;
 
-    start(nthreads);
+pub struct Server {
+    nthreads: usize,
+}
+
+impl Server {
+    pub fn new(nthreads: usize) -> Self {
+        unimplemented!();
+    }
+
+    pub fn serve(&mut self) {
+        unimplemented!();
+    }
+
+    pub fn terminator(&mut self) -> Terminator {
+        unimplemented!();
+    }
 }
