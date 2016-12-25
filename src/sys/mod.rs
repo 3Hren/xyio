@@ -16,7 +16,7 @@ bitflags! {
 
 pub fn epoll_create(flags: EPollFlags) -> Result<i32, Errno> {
     let fd = unsafe {
-        ffi::epoll_create1(flags.bits())
+        libc::epoll_create1(flags.bits())
     };
 
     if fd >= 0 {
@@ -28,7 +28,7 @@ pub fn epoll_create(flags: EPollFlags) -> Result<i32, Errno> {
 
 pub fn accept4(sockfd: libc::c_int, flags: libc::c_int) -> Result<i32, Errno> {
     let fd = unsafe {
-        ffi::accept4(sockfd, ptr::null_mut(), ptr::null_mut(), flags)
+        libc::accept4(sockfd, ptr::null_mut(), ptr::null_mut(), flags)
     };
 
     if fd >= 0 {
