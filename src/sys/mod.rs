@@ -42,7 +42,7 @@ pub fn sendmsg(fd: RawFd, iov: &[&[u8]], flags: socket::MsgFlags) -> Result<usiz
     let mhdr = libc::msghdr {
         msg_name: 0 as *mut libc::c_void,
         msg_namelen: 0,
-        msg_iov: iov.as_ptr() as *mut ffi::IoVec as *mut libc::iovec,
+        msg_iov: iov.as_ptr() as *mut libc::iovec,
         msg_iovlen: iov.len(),
         msg_control: 0 as *mut libc::c_void,
         msg_controllen: 0,
