@@ -6,15 +6,13 @@ use libc;
 use nix::errno::Errno;
 use nix::sys::socket;
 
-mod ffi;
-
 bitflags! {
     pub flags EPollFlags: i32 {
         const EPOLL_CLOEXEC = 0x80000,
     }
 }
 
-pub fn epoll_create(flags: EPollFlags) -> Result<i32, Errno> {
+pub fn epoll_create1(flags: EPollFlags) -> Result<i32, Errno> {
     let fd = unsafe {
         libc::epoll_create1(flags.bits())
     };

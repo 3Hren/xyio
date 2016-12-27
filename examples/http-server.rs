@@ -16,6 +16,11 @@ fn main() {
            .value_name("THREADS")
            .help("number of worker threads")
            .takes_value(true))
+        .arg(Arg::with_name("port")
+           .long("port")
+           .value_name("PORT")
+           .help("port")
+           .takes_value(true))
         .arg(Arg::with_name("v")
            .short("v")
            .multiple(true)
@@ -29,10 +34,15 @@ fn main() {
         .map_or(Ok(4), |v| v.parse())
         .expect("failed to parse THREADS argument");
 
-    serve(nthreads);
+    let port = matches.value_of("port")
+        .map_or(Ok(8080), |v| v.parse())
+        .expect("failed to parse PORT argument");
+
+    serve(nthreads, port);
 
     // let server = ServerBuilder::new()
     //     .with_threads(nthreads)
+    //     .port(8080)
     //     .build();
     // server.serve(PingDispatchFactory).join();
 }

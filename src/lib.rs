@@ -14,7 +14,7 @@ extern crate httparse;
 extern crate http_muncher;
 
 pub mod collections;
-// pub mod io;
+pub mod http;
+pub mod io;
 pub mod logging;
 pub mod sys;
-pub mod http;

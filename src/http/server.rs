@@ -16,7 +16,8 @@ use nix::fcntl;
 use nix::sys::{epoll, socket};
 use nix::unistd::{close, pipe2, read, write};
 
-use sys::{epoll_create, accept4, sendmsg, EPOLL_CLOEXEC};
+use io::FileDesc;
+use sys::{epoll_create1, accept4, sendmsg, EPOLL_CLOEXEC};
 
 const PIPELINE_NUMBER: usize = 64;
 
@@ -44,7 +45,7 @@ pub struct Context {
 impl Context {
     ///
     pub fn new() -> Result<Context, Error> {
-        let fd = epoll_create(EPOLL_CLOEXEC)?;
+        let fd = epoll_create1(EPOLL_CLOEXEC)?;
 
         let ctx = Context {
             reactor: fd,
@@ -80,40 +81,6 @@ impl FromRawFd for Context {
     }
 }
 
-/// Auto-closable raw file descriptor owner.
-struct FileDesc {
-    fd: RawFd,
-}
-
-impl Drop for FileDesc {
-    fn drop(&mut self) {
-        // Note that errors aren't handled when closing a file descriptor. The reason for this is
-        // that if an error occurs we don't actually know if the file descriptor was closed or not,
-        // and if we retried (for something like EINTR), we might close another valid file
-        // descriptor opened after we closed ours.
-        // Also note that this syscall may block, for example when there are unflushed buffers.
-        if let Err(err) = close(self.fd) {
-            error!("failed to close file descriptor {}: {:?}", self.fd, err);
-        } else {
-            debug!("closed fd {}", self.fd);
-        }
-    }
-}
-
-impl FromRawFd for FileDesc {
-    unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        FileDesc {
-            fd: fd,
-        }
-    }
-}
-
-impl AsRawFd for FileDesc {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
 type SharedContext = Rc<RefCell<Context>>;
 
 struct TcpSocket {
@@ -136,9 +103,7 @@ impl TcpSocket {
         };
         ctx.borrow_mut().fdmap.insert(fd, evd);
 
-        let fd = FileDesc {
-            fd: fd,
-        };
+        let fd = unsafe { FileDesc::from_raw_fd(fd) };
 
         let sock = TcpSocket {
             fd: fd,
@@ -978,7 +943,7 @@ fn run(reactor: i32, rd: i32) {
 pub fn serve(nthreads: usize) {
     let mut workers = Vec::with_capacity(nthreads);
     for tid in 0..nthreads {
-        let epollfd = epoll_create(EPOLL_CLOEXEC)
+        let epollfd = epoll_create1(EPOLL_CLOEXEC)
             .expect("failed to initialize epollfd");
 
         let (rd, wr) = pipe2(fcntl::O_NONBLOCK | fcntl::O_CLOEXEC)
@@ -1032,7 +997,7 @@ pub fn serve(nthreads: usize) {
     }
 
     for (thread, wr, rd) in workers.drain(..) {
-        close(rd).map(drop);
+        close(rd).unwrap();
         close(wr).unwrap();
 
         thread.join().unwrap();
