@@ -955,7 +955,7 @@ pub fn serve(nthreads: usize, port: u16) {
         };
 
         epoll::epoll_ctl(epollfd, epoll::EpollOp::EpollCtlAdd, rd, &event)
-            .expect("unable to register control channel in the reactor");
+            .expect("unable to register control channel with the reactor");
 
         let thread = thread::Builder::new().name(format!("work#{:02}", tid)).spawn(move || {
             debug!("worker thread has been started");
