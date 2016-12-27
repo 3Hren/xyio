@@ -940,7 +940,7 @@ fn run(reactor: i32, rd: i32) {
 //     Ok((wr, rd))
 // }
 
-pub fn serve(nthreads: usize) {
+pub fn serve(nthreads: usize, port: u16) {
     let mut workers = Vec::with_capacity(nthreads);
     for tid in 0..nthreads {
         let epollfd = epoll_create1(EPOLL_CLOEXEC)
@@ -967,7 +967,7 @@ pub fn serve(nthreads: usize) {
     }
 
     // Listen.
-    let listener = TcpListener::bind(("::", 8080)).unwrap();
+    let listener = TcpListener::bind(("::", port)).unwrap();
     let fd = listener.as_raw_fd();
 
     info!("ready to serve");
