@@ -392,8 +392,10 @@ impl Request {
     }
 
     pub fn clear(&mut self) {
-        self.url.clear();
-        self.headers.clear();
+        unsafe {
+            self.url.set_len(0);
+            self.headers.set_len(0);
+        }
     }
 }
 
@@ -616,15 +618,14 @@ impl<D: Dispatch + 'static> Reader<D> {
     }
 }
 
-enum WriterState {
-    Idle,
-    Pending,
+enum WriterState<W> {
+    /// Stream is idle.
+    Idle(W),
+    Flushing,
 }
 
 struct Writer<W> {
-    /// Writable stream.
-    wr: W,
-    state: WriterState,
+    state: WriterState<W>,
 
     bufs: Vec<Cursor<Vec<u8>>>,
     cur: usize,
@@ -641,8 +642,7 @@ impl<W: StreamWrite> Writer<W> {
         }
 
         Writer {
-            wr: wr,
-            state: WriterState::Idle,
+            state: WriterState::Idle(wr),
 
             bufs: vec![Cursor::new(Vec::new()); PIPELINE_NUMBER],
             cur: 0,
@@ -655,14 +655,12 @@ impl<W: StreamWrite> Writer<W> {
         where F: Fn(Result<(), Error>, Vec<u8>) + 'static
     {
         // Try to write some data right away, if we don't have anything pending.
-        if let WriterState::Idle = self.state {
-            match self.wr.send(&buf[..]) {
+        if let WriterState::Idle(ref mut wr) = self.state {
+            match wr.send(&buf[..]) {
                 Ok(nsize) if nsize == buf.len() => {
-                    trace!("written {} bytes [request {}, fd: {}]", nsize, id, self.wr.as_raw_fd());
+                    trace!("written {} bytes [request {}, fd: {}]", nsize, id, wr.as_raw_fd());
                     // Operation has been completed immediately, such performance, wow.
-                    let fd = self.wr.as_raw_fd();
-                    self.wr.context().borrow_mut().post(move || {
-                        trace!("completed response write operation [fd: {}]", fd);
+                    wr.context().borrow_mut().post(move || {
                         f(Ok(()), buf);
                     });
                     return;
@@ -679,12 +677,10 @@ impl<W: StreamWrite> Writer<W> {
             }
         }
 
-        if let WriterState::Pending = std::mem::replace(&mut self.state, WriterState::Pending) {
-            return;
+        // Otherwise switch to flushing state.
+        if let WriterState::Idle(wr) = std::mem::replace(&mut self.state, WriterState::Flushing) {
+            // self.wr.async_send();
         }
-
-        // TODO: Start async operation.
-        unimplemented!();
     }
 }
 
